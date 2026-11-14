@@ -186,6 +186,7 @@ def main() -> int:
 
     fd = open_serial(port)
     pending, early = pull_stored(fd, handle, writer)
+    print("このあとの行を記録します。止めるときは Ctrl+C", flush=True)
     for pi_time, psoc_time, message in early:
         write_row(handle, writer, pi_time, psoc_time, message)
 
@@ -206,6 +207,7 @@ def main() -> int:
                 psoc_time, message = split_line(text)
                 pi_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
                 write_row(handle, writer, pi_time, psoc_time, message)
+                print(text, flush=True)
     except KeyboardInterrupt:
         return 0
     finally:
