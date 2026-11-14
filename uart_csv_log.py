@@ -3,7 +3,8 @@
 
 起動のたびに新しいファイルを作る。
 先に PSoC の EEPROM に残っている動作ログを読み出し、そのあと届いた行を足す。
-  uart_logs/psoc_uart_YYYYMMDD_HHMMSS.csv
+CSV は log フォルダに置く。フォルダが無ければ作る。
+  log/psoc_uart_YYYYMMDD_HHMMSS.csv
 
 列は次の3つ。
   pi_time    行を受け取った瞬間のラズパイ時刻（タイムゾーン付き）
@@ -15,7 +16,7 @@
 
 使い方:
   python3 uart_csv_log.py
-  python3 uart_csv_log.py --port /dev/ttyUSB0 --dir /var/log/psoc-uart
+  python3 uart_csv_log.py --port /dev/ttyUSB0 --dir log
 
 起動時の自動実行と、PSoC 更新前の停止は psoc_uart_log.sh を使う。
 """
@@ -75,8 +76,9 @@ def open_serial(path: str) -> int:
     attrs[3] = 0
     attrs[6][termios.VMIN] = 1
     attrs[6][termios.VTIME] = 0
-    termios.cfsetispeed(attrs, termios.B115200)
-    termios.cfsetospeed(attrs, termios.B115200)
+    # tcgetattr の 4 が入力速度、5 が出力速度。cfsetispeed が無い Python でも同じ設定になる
+    attrs[4] = termios.B115200
+    attrs[5] = termios.B115200
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
     termios.tcflush(fd, termios.TCIFLUSH)
     return fd
@@ -174,7 +176,7 @@ def open_csv(directory: Path) -> tuple[object, csv.writer, Path]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="PSoC UART を CSV に記録する")
     parser.add_argument("--port", help="例: /dev/ttyUSB0。省略時は CP210x を探す")
-    parser.add_argument("--dir", default="uart_logs", help="CSV を置くディレクトリ")
+    parser.add_argument("--dir", default="log", help="CSV を置くディレクトリ。無ければ作る")
     args = parser.parse_args()
 
     port = args.port or find_port()
