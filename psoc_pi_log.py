@@ -38,6 +38,9 @@ PSOC_TIME = re.compile(
 )
 CLOCK_FACE = re.compile(r"^(?P<h>\d{2})[/:](?P<m>\d{2})[/:](?P<s>\d{2})$")
 DUMP_LINE = re.compile(r"^LOGDUMP\s+(?P<psoc>\S+)\s*(?P<rest>.*)$")
+DUMP_STS = re.compile(
+    r"^(?P<s1>[0-9A-Fa-f]{2}),(?P<s2>[0-9A-Fa-f]{2}),(?P<s3>[0-9A-Fa-f]{2}),(?P<s4>[0-9A-Fa-f]{2})(?: (?P<text>.*))?$"
+)
 
 AF_CAN = getattr(socket, "AF_CAN", 29)
 CAN_RAW = getattr(socket, "CAN_RAW", 1)
@@ -203,6 +206,10 @@ UART_COLUMNS = [
     "psoc_time",
     "kind",
     "message",
+    "sts1",
+    "sts2",
+    "sts3",
+    "sts4",
     "m1_sw",
     "m1_state",
     "m1_remote",
@@ -396,6 +403,18 @@ def motor_fields(prefix: str, sw_text: str, trq_text: str, din: str) -> dict[str
 
 def blank_uart() -> dict[str, str]:
     return {name: "" for name in UART_COLUMNS}
+
+
+def split_dump_rest(rest: str) -> tuple[str, dict[str, str]]:
+    matched = DUMP_STS.match(rest)
+    if matched is None:
+        return rest, {}
+    return matched.group("text") or "", {
+        "sts1": matched.group("s1").lower(),
+        "sts2": matched.group("s2").lower(),
+        "sts3": matched.group("s3").lower(),
+        "sts4": matched.group("s4").lower(),
+    }
 
 
 def uart_note(message: str) -> dict[str, str]:
@@ -1184,10 +1203,10 @@ class UartLink:
             return
         matched = DUMP_LINE.match(text)
         if self.phase == "dump" and matched is not None:
-            book.write(
-                uart_from_line(matched.group("psoc"), matched.group("rest"), "dump"),
-                sync=False,
-            )
+            text, sts = split_dump_rest(matched.group("rest"))
+            row = uart_from_line(matched.group("psoc"), text, "dump")
+            row.update(sts)
+            book.write(row, sync=False)
             self.stored += 1
             self.dump_since_sync += 1
             self.end_deadline = now + 10.0
@@ -1228,6 +1247,9 @@ def self_test() -> int:
     check(motor["m1_silent_s"] == "1" and motor["m2_silent_s"] == "2", "silence")
     can = uart_from_line("17:21:00", "CANERR,0,0,0,0,0,2,0,181=3")
     check(can["can_arb"] == "2" and can["can_txfail"] == "181=3", "canerr")
+    text, sts = split_dump_rest("01,20,03,0a START 1")
+    check(text == "START 1" and sts["sts2"] == "20" and sts["sts3"] == "03", "dump sts")
+    check(split_dump_rest("RASP RS")[0] == "RASP RS", "dump without sts")
     check(parse_cpu_temp("temp=48.2'C\n", "") == "48.2", "vcgencmd temp")
     check(parse_cpu_temp("", "51234\n") == "51.2", "sysfs temp")
     check(port_block_reason("/dev/serial0") != "", "block serial0")
