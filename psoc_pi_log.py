@@ -137,14 +137,12 @@ AGE_IDS = (
 )
 
 RE_STATE = re.compile(r"can state (\S+)")
-RE_BERR = re.compile(r"berr-counter tx (\d+) rx (\d+)")
 RE_BITRATE = re.compile(r"\bbitrate\s+(\d+)")
 RE_CLOCK = re.compile(r"\bclock\s+(\d+)")
 RE_SAMP = re.compile(r"sample-point\s+([0-9.]+)")
 RE_SJW = re.compile(r"\bsjw\s+(\d+)")
 RE_RESTART = re.compile(r"restart-ms\s+(\d+)")
 RE_QLEN = re.compile(r"\bqlen\s+(\d+)")
-RE_VOLT = re.compile(r"=\s*([0-9]+(?:\.[0-9]+)?)V")
 RE_CPU_TEMP = re.compile(r"temp=([0-9]+(?:\.[0-9]+)?)")
 RE_STATS = re.compile(
     r"re-started\s+bus-errors\s+arbit-lost\s+error-warn\s+error-pass\s+bus-off\s+"
@@ -190,8 +188,6 @@ THROTTLE_BITS = (
 CHANGE_KEYS = (
     "can_link",
     "can_state",
-    "can_tec",
-    "can_rec",
     "can_restarts",
     "can_bus_errors",
     "can_arbit_lost",
@@ -255,7 +251,7 @@ AGE_COLUMNS: list[str] = []
 for _can_id, _tag in AGE_IDS:
     AGE_COLUMNS.append(f"last_{_tag}")
     AGE_COLUMNS.append(f"age_{_tag}_s")
-POWER_COLUMNS = ["input_v", "amp", "temp1", "temp2", "temp3", "batt_v"]
+POWER_COLUMNS = ["amp", "temp1", "temp2", "temp3"]
 STATUS_COLUMNS = [
     "pi_time",
     "uptime_s",
@@ -267,8 +263,6 @@ STATUS_COLUMNS = [
     *POWER_COLUMNS,
     "can_link",
     "can_state",
-    "can_tec",
-    "can_rec",
     "can_restarts",
     "can_bus_errors",
     "can_arbit_lost",
@@ -301,8 +295,6 @@ CAN_COLUMNS = [
     "kind",
     "can_link",
     "can_state",
-    "can_tec",
-    "can_rec",
     "can_restarts",
     "can_bus_errors",
     "can_arbit_lost",
@@ -320,8 +312,6 @@ CAN_COLUMNS = [
     "err_prot",
     "err_loc",
     "err_ctrl",
-    "err_tec",
-    "err_rec",
     "err_data",
     "app_unit",
     "app_active",
@@ -500,16 +490,12 @@ def decode_error(can_id: int, data: bytes) -> dict[str, str]:
     if err & CAN_ERR_PROT and loc_byte == 0:
         loc = "UNSPEC"
     ctrl = names_of(ctrl_byte, CTRL_BITS) if err & CAN_ERR_CRTL else []
-    tec = str(data[6]) if len(data) > 6 else ""
-    rec = str(data[7]) if len(data) > 7 else ""
     return {
         "err_cause": err_cause(prot, loc, classes, ctrl),
         "err_class": "+".join(classes),
         "err_prot": "+".join(prot),
         "err_loc": loc,
         "err_ctrl": "+".join(ctrl),
-        "err_tec": tec,
-        "err_rec": rec,
         "err_data": data.hex(),
     }
 
@@ -607,13 +593,6 @@ def throttle_text(value: int) -> str:
     return " ".join(names) if names else "なし"
 
 
-def parse_volts(text: str) -> str:
-    matched = RE_VOLT.search(text)
-    if matched is None:
-        return ""
-    return f"{float(matched.group(1)):.3f}"
-
-
 def read_text(path: str) -> str:
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace")
@@ -657,23 +636,6 @@ def run_cmd(args: list[str], timeout: float) -> str:
     if proc.returncode != 0 and not proc.stdout:
         return ""
     return (proc.stdout or "") + (proc.stderr or "")
-
-
-def read_input_voltage() -> str:
-    return parse_volts(run_cmd(["vcgencmd", "pmic_read_adc", "EXT5V_V"], 0.4))
-
-
-def read_batt(path: str) -> str:
-    if not path or port_block_reason(path):
-        return ""
-    text = read_text(path).strip()
-    if not text:
-        return ""
-    token = text.split()[0]
-    try:
-        return f"{float(token):.3f}"
-    except ValueError:
-        return ""
 
 
 def read_load1() -> str:
@@ -743,8 +705,6 @@ def parse_can(text: str) -> dict[str, str]:
     row = {
         "can_link": "",
         "can_state": "",
-        "can_tec": "",
-        "can_rec": "",
         "can_restarts": "",
         "can_bus_errors": "",
         "can_arbit_lost": "",
@@ -788,11 +748,6 @@ def parse_can(text: str) -> dict[str, str]:
         matched = regex.search(text)
         if matched:
             row[key] = matched.group(1)
-    # berr-reporting は非対応なので、この行は通常出ない。出たときだけ使う。
-    berr = RE_BERR.search(text)
-    if berr:
-        row["can_tec"] = berr.group(1)
-        row["can_rec"] = berr.group(2)
     stats = RE_STATS.search(text)
     if stats:
         row["can_restarts"] = stats.group(1)
@@ -1264,7 +1219,7 @@ def self_test() -> int:
     form = decode_error(CAN_ERR_FLAG | CAN_ERR_PROT, bytes([0, 0, 0x02, 0x18, 0, 0, 5, 6]))
     check(form["err_cause"] == "form+CRC", "form+crc " + form["err_cause"])
 
-    same = {"can_link": "UP", "can_state": "ERROR-ACTIVE", "can_tec": "0", "can_rx": "1"}
+    same = {"can_link": "UP", "can_state": "ERROR-ACTIVE", "can_rx": "1"}
     other = dict(same)
     other["can_rx"] = "99"
     changed = dict(same)
@@ -1293,11 +1248,6 @@ def main() -> int:
         "--app-unit",
         default=os.environ.get("PSOC_PI_LOG_APP_UNIT", ""),
         help="起動と終了を残す systemd unit。未指定なら残さない",
-    )
-    parser.add_argument(
-        "--batt-file",
-        default=os.environ.get("PSOC_PI_LOG_BATT_FILE", ""),
-        help="バッテリ電圧が 1 行で書いてあるファイル。serial0 は開かない",
     )
     parser.add_argument("--keep-days", type=int, default=14)
     parser.add_argument("--can-keep-days", type=int, default=30)
@@ -1336,10 +1286,8 @@ def main() -> int:
     seen: dict[int, tuple[float, str]] = {}
     health: bytes | None = None
     health_at: float | None = None
-    power = {"input_v": "", "amp": "", "temp1": "", "temp2": "", "temp3": "", "batt_v": ""}
+    power = {"amp": "", "temp1": "", "temp2": "", "temp3": ""}
     can_now: dict[str, str] = parse_can("")
-    frame_tec = ""
-    frame_rec = ""
     prev_change: tuple[str, ...] | None = None
     prev_timing: tuple[str, ...] | None = None
     prev_app: dict[str, str] | None = None
@@ -1347,7 +1295,6 @@ def main() -> int:
     next_can = 0.0
     next_status = 0.0
     next_app = 0.0
-    next_power = 0.0
     can_interval = args.can_ms / 1000.0
 
     def power_now() -> dict[str, str]:
@@ -1364,15 +1311,12 @@ def main() -> int:
         return row
 
     def pull_can() -> None:
-        nonlocal health, health_at, frame_tec, frame_rec
+        nonlocal health, health_at
         if err_sock is not None:
             for can_id, _dlc, data in drain_frames(err_sock):
                 if not (can_id & CAN_ERR_FLAG):
                     continue
                 decoded = decode_error(can_id, data)
-                if decoded["err_tec"] != "":
-                    frame_tec = decoded["err_tec"]
-                    frame_rec = decoded["err_rec"]
                 row = context("error")
                 row.update(decoded)
                 can_book.write(row, sync=False)
@@ -1422,9 +1366,6 @@ def main() -> int:
 
             if now >= next_can:
                 can_now = parse_can(link_text(args.iface))
-                if can_now["can_tec"] == "" and frame_tec != "":
-                    can_now["can_tec"] = frame_tec
-                    can_now["can_rec"] = frame_rec
                 timing = timing_key(can_now)
                 if timing != prev_timing and any(timing):
                     row = context("timing")
@@ -1433,16 +1374,12 @@ def main() -> int:
                     prev_timing = timing
                 current = change_key(can_now)
                 if current != prev_change and any(current):
-                    if now >= next_power:
-                        power["input_v"] = read_input_voltage()
-                        power["batt_v"] = read_batt(args.batt_file)
-                        next_power = now + 1.0
                     row = context("state")
                     can_book.write(row)
                     prev_change = current
                     print(
                         f"{row['pi_time']}  {row['can_link']} {row['can_state']} "
-                        f"tec={row['can_tec']} rec={row['can_rec']} busoff={row['can_bus_off']}",
+                        f"busoff={row['can_bus_off']}",
                         flush=True,
                     )
                 next_can = time.monotonic() + can_interval
@@ -1459,9 +1396,6 @@ def main() -> int:
 
             if now >= next_status:
                 fresh = read_cpu_jiffies()
-                power["input_v"] = read_input_voltage()
-                power["batt_v"] = read_batt(args.batt_file)
-                next_power = now + 1.0
                 throttled = read_throttled()
                 row = {
                     "pi_time": pi_now(),
