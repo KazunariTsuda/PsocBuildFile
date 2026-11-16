@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""PSoC の UART と、ラズパイ自身の状態を、別フォルダの CSV に残す。
+"""PSoC の UART と、ラズパイの CAN・電源・カーネルを CSV に残す。
 
-起動のたびにファイルを 1 つずつ作る。
-  log/uart/psoc_uart_YYYYMMDD_HHMMSS.csv
-  log/status/pi_status_YYYYMMDD_HHMMSS.csv
+走行アプリとは別プロセスで動かす。アプリが bus-off で止まっても記録は続ける。
+起動のたびにファイルは増やさず、日付ごとに追記する。
 
-UART は、先に PSoC の EEPROM を読み、そのあと届いた行を足す。
-状態は --interval 秒ごと（既定 10 秒）。温度、5V 電圧、CPU 使用率、CAN。
-各フォルダは新しい 100 件だけ残し、それより古いファイルは消す。
+  log/uart/psoc_uart_YYYYMMDD.csv      受信した行。14 日
+  log/status/pi_status_YYYYMMDD.csv    10 秒ごとの状態。14 日
+  log/can/can_event_YYYYMMDD.csv       ビットタイミング、CAN の変化、エラーフレーム、アプリの起動と終了。30 日
+  log/kernel/kern_YYYYMMDD.csv         journalctl -k のうち CAN / SPI。30 日
+
+pi_time は現地時刻にオフセットを付けた ISO 時刻。ミリ秒まで。
+UART は届いた順に書く。並べるときは pi_time を使う。
 
   python3 psoc_pi_log.py
-  python3 psoc_pi_log.py --port /dev/ttyUSB0 --dir log
-
-起動時の自動実行と、PSoC 更新前の停止は psoc_pi_log.sh を使う。
+  python3 psoc_pi_log.py --port /dev/serial/by-id/usb-Silicon_Labs_... --dir log
+  python3 psoc_pi_log.py --self-test
 """
 
 from __future__ import annotations
@@ -31,153 +33,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-PSOC_TIME = re.compile(r"^(?P<psoc>(?:\d{2}[/:]\d{2}[/:]\d{2})|(?:--[/:]--[/:]--))\s*(?P<rest>.*)$")
+PSOC_TIME = re.compile(
+    r"^(?P<psoc>(?:\d{2}[/:]\d{2}[/:]\d{2})|(?:--[/:]--[/:]--))\s*(?P<rest>.*)$"
+)
 CLOCK_FACE = re.compile(r"^(?P<h>\d{2})[/:](?P<m>\d{2})[/:](?P<s>\d{2})$")
 DUMP_LINE = re.compile(r"^LOGDUMP\s+(?P<psoc>\S+)\s*(?P<rest>.*)$")
-
-
-def pi_now(millis: bool = True) -> str:
-    """ラズパイの現地時刻。タイムゾーンの表示は付けない。"""
-    now = datetime.now().astimezone()
-    if millis:
-        return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-    return now.strftime("%Y-%m-%dT%H:%M:%S")
-
-
-def clock_text(raw: str) -> str:
-    """時/分/秒を時:分:秒にする。日付付きやミリ秒の行はそのまま。"""
-    matched = CLOCK_FACE.match(raw)
-    if matched is not None:
-        return f"{matched.group('h')}:{matched.group('m')}:{matched.group('s')}"
-    if raw in ("--/--/--", "--:--:--"):
-        return "--:--:--"
-    return raw
-
-
-def split_line(text: str) -> tuple[str, str]:
-    """行頭が PSoC 時刻なら分離する。無ければ時刻は空で、本文は行全体。"""
-    matched = PSOC_TIME.match(text.strip())
-    if matched is None:
-        return "", text.strip()
-    return clock_text(matched.group("psoc")), matched.group("rest")
-
-
-def find_port() -> str:
-    by_id = Path("/dev/serial/by-id")
-    hits: list[Path] = []
-    if by_id.is_dir():
-        for path in sorted(by_id.iterdir()):
-            name = path.name.lower()
-            if "cp210" in name or "silicon_labs" in name or "siliconlabs" in name:
-                hits.append(path)
-    if len(hits) == 1:
-        return str(hits[0])
-    if len(hits) > 1:
-        names = "\n".join(str(path) for path in hits)
-        raise SystemExit("CP210x が複数あります。--port で指定してください。\n" + names)
-    usbs = sorted(Path("/dev").glob("ttyUSB*"))
-    if len(usbs) == 1:
-        return str(usbs[0])
-    raise SystemExit("CP210x が見つかりません。--port で /dev/ttyUSB* を指定してください。")
-
-
-def open_serial(path: str) -> int:
-    import termios
-
-    fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
-    attrs = termios.tcgetattr(fd)
-    attrs[0] = 0
-    attrs[1] = 0
-    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
-    attrs[3] = 0
-    attrs[6][termios.VMIN] = 1
-    attrs[6][termios.VTIME] = 0
-    # tcgetattr の 4 が入力速度、5 が出力速度。cfsetispeed が無い Python でも同じ設定になる
-    attrs[4] = termios.B115200
-    attrs[5] = termios.B115200
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
-    termios.tcflush(fd, termios.TCIFLUSH)
-    return fd
-
-
-def write_row(handle, writer, pi_time: str, psoc_time: str, message: str) -> None:
-    writer.writerow([pi_time, psoc_time, message])
-    handle.flush()
-    os.fsync(handle.fileno())
-
-
-def send_log_request(fd: int) -> None:
-    """受信側は 4 バイトしか溜められないので、LOG を 1 バイトずつ送る。"""
-    for byte in b"LOG\n":
-        os.write(fd, bytes([byte]))
-        time.sleep(0.008)
-
-
-def take_lines(pending: bytearray) -> list[str]:
-    lines: list[str] = []
-    while True:
-        cut = pending.find(b"\n")
-        if cut < 0:
-            break
-        raw = pending[:cut]
-        del pending[: cut + 1]
-        text = raw.decode("utf-8", errors="replace").rstrip("\r").strip()
-        if text != "" and text != "LOG":
-            lines.append(text)
-    return lines
-
-
-def pull_stored(fd: int, handle, writer) -> tuple[bytearray, list[tuple[str, str, str]]]:
-    """EEPROM のログを先に CSV へ書く。届いていた通常行はあとで足す。"""
-    pending = bytearray()
-    early: list[tuple[str, str, str]] = []
-    begun = False
-    stored = 0
-    begin_deadline = time.monotonic() + 15.0
-    next_send = 0.0
-    end_deadline = None
-    print("保存ログを読み出します", flush=True)
-
-    while True:
-        now = time.monotonic()
-        if not begun and now >= next_send:
-            send_log_request(fd)
-            next_send = now + 5.0
-        if not begun and now >= begin_deadline:
-            print("保存ログは取れませんでした。このあとの行だけ記録します。", flush=True)
-            break
-        if begun and end_deadline is not None and now >= end_deadline:
-            print("保存ログの終わりが来ませんでした。取れた分だけ残します。", flush=True)
-            break
-        ready, _, _ = select.select([fd], [], [], 0.2)
-        if not ready:
-            continue
-        chunk = os.read(fd, 256)
-        if not chunk:
-            continue
-        pending.extend(chunk)
-        for text in take_lines(pending):
-            if text == "LOGBEGIN":
-                begun = True
-                end_deadline = time.monotonic() + 10.0
-                continue
-            if text == "LOGEND":
-                print(f"保存ログ: {stored} 件", flush=True)
-                return pending, early
-            matched = DUMP_LINE.match(text)
-            if begun and matched is not None:
-                pi_time = pi_now()
-                write_row(handle, writer, pi_time, matched.group("psoc"), matched.group("rest"))
-                stored += 1
-                end_deadline = time.monotonic() + 10.0
-                continue
-            psoc_time, message = split_line(text)
-            pi_time = pi_now()
-            early.append((pi_time, psoc_time, message))
-    return pending, early
-
-
-KEEP_FILES = 100
 
 AF_CAN = getattr(socket, "AF_CAN", 29)
 CAN_RAW = getattr(socket, "CAN_RAW", 1)
@@ -185,12 +45,102 @@ CAN_ERR_FLAG = 0x20000000
 CAN_SFF_MASK = 0x000007FF
 SOL_CAN_RAW = 101
 CAN_RAW_FILTER = 1
+CAN_RAW_ERR_FILTER = 2
 CAN_FRAME_FMT = "=IB3x8s"
 CAN_FRAME_SIZE = struct.calcsize(CAN_FRAME_FMT)
-ID_HEALTH = 0x092
+
+CAN_ERR_TX_TIMEOUT = 0x00000001
+CAN_ERR_LOSTARB = 0x00000002
+CAN_ERR_CRTL = 0x00000004
+CAN_ERR_PROT = 0x00000008
+CAN_ERR_TRX = 0x00000010
+CAN_ERR_ACK = 0x00000020
+CAN_ERR_BUSOFF = 0x00000040
+CAN_ERR_BUSERROR = 0x00000080
+CAN_ERR_RESTARTED = 0x00000100
+CAN_ERR_MASK = 0x1FFFFFFF
+CAN_ERR_CRTL_RX_OVERFLOW = 0x01
+CAN_ERR_CRTL_TX_OVERFLOW = 0x02
+CAN_ERR_CRTL_RX_WARNING = 0x04
+CAN_ERR_CRTL_TX_WARNING = 0x08
+CAN_ERR_CRTL_RX_PASSIVE = 0x10
+CAN_ERR_CRTL_TX_PASSIVE = 0x20
+CAN_ERR_CRTL_ACTIVE = 0x40
+
+CLASS_BITS = (
+    (CAN_ERR_TX_TIMEOUT, "TX_TIMEOUT"),
+    (CAN_ERR_LOSTARB, "LOSTARB"),
+    (CAN_ERR_CRTL, "CRTL"),
+    (CAN_ERR_PROT, "PROT"),
+    (CAN_ERR_TRX, "TRX"),
+    (CAN_ERR_ACK, "ACK"),
+    (CAN_ERR_BUSOFF, "BUSOFF"),
+    (CAN_ERR_BUSERROR, "BUSERR"),
+    (CAN_ERR_RESTARTED, "RESTART"),
+)
+PROT_BITS = (
+    (0x01, "bit"),
+    (0x02, "form"),
+    (0x04, "stuff"),
+    (0x08, "bit0"),
+    (0x10, "bit1"),
+    (0x20, "overload"),
+    (0x40, "active"),
+    (0x80, "tx"),
+)
+PROT_LOC = {
+    0x00: "UNSPEC",
+    0x02: "ID28_21",
+    0x03: "SOF",
+    0x04: "SRTR",
+    0x05: "IDE",
+    0x06: "ID20_18",
+    0x07: "ID17_13",
+    0x08: "CRC_SEQ",
+    0x09: "RES0",
+    0x0A: "DATA",
+    0x0B: "DLC",
+    0x0C: "RTR",
+    0x0D: "RES1",
+    0x0E: "ID04_00",
+    0x0F: "ID12_05",
+    0x12: "INTERM",
+    0x18: "CRC_DEL",
+    0x19: "ACK",
+    0x1A: "EOF",
+    0x1B: "ACK_DEL",
+}
+CTRL_BITS = (
+    (CAN_ERR_CRTL_TX_PASSIVE, "TX_PASSIVE"),
+    (CAN_ERR_CRTL_RX_PASSIVE, "RX_PASSIVE"),
+    (CAN_ERR_CRTL_TX_WARNING, "TX_WARN"),
+    (CAN_ERR_CRTL_RX_WARNING, "RX_WARN"),
+    (CAN_ERR_CRTL_ACTIVE, "ACTIVE"),
+    (CAN_ERR_CRTL_RX_OVERFLOW, "RX_OVERFLOW"),
+    (CAN_ERR_CRTL_TX_OVERFLOW, "TX_OVERFLOW"),
+)
+
+# 0x181 / 0x182 は、この PSoC がモータ状態として受信している TPDO。
+# 0x381 / 0x382 は依頼どおり別に見る。出ていなければ列は空のまま。
+WATCH_IDS = (0x090, 0x092, 0x0A0, 0x0C0, 0x181, 0x182, 0x381, 0x382)
+AGE_IDS = (
+    (0x090, "090"),
+    (0x0A0, "0a0"),
+    (0x0C0, "0c0"),
+    (0x181, "181"),
+    (0x182, "182"),
+    (0x381, "381"),
+    (0x382, "382"),
+)
 
 RE_STATE = re.compile(r"can state (\S+)")
 RE_BERR = re.compile(r"berr-counter tx (\d+) rx (\d+)")
+RE_BITRATE = re.compile(r"\bbitrate\s+(\d+)")
+RE_CLOCK = re.compile(r"\bclock\s+(\d+)")
+RE_SAMP = re.compile(r"sample-point\s+([0-9.]+)")
+RE_SJW = re.compile(r"\bsjw\s+(\d+)")
+RE_RESTART = re.compile(r"restart-ms\s+(\d+)")
+RE_QLEN = re.compile(r"\bqlen\s+(\d+)")
 RE_VOLT = re.compile(r"=\s*([0-9]+(?:\.[0-9]+)?)V")
 RE_STATS = re.compile(
     r"re-started\s+bus-errors\s+arbit-lost\s+error-warn\s+error-pass\s+bus-off\s+"
@@ -207,6 +157,9 @@ RE_TX = re.compile(
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
     re.S,
 )
+KERN_KEEP = re.compile(r"mcp251|\bcan\d|\bspi|overflow|bus-off|bus off", re.I)
+BLOCKED_TTY = {"serial0", "serial1", "ttyama0", "ttys0"}
+
 PSOC_FLAG_BITS = (
     (0x01, "停止中"),
     (0x02, "試行上限"),
@@ -229,15 +182,37 @@ THROTTLE_BITS = (
     (1 << 18, "温度制限の履歴"),
     (1 << 19, "ソフト温度の履歴"),
 )
+
+CHANGE_KEYS = (
+    "can_link",
+    "can_state",
+    "can_tec",
+    "can_rec",
+    "can_restarts",
+    "can_bus_errors",
+    "can_arbit_lost",
+    "can_error_warn",
+    "can_error_pass",
+    "can_bus_off",
+)
+TIMING_KEYS = ("clock", "bitrate", "sample_point", "sjw", "restart_ms", "qlen")
+
+UART_COLUMNS = ["pi_time", "psoc_time", "message"]
+KERN_COLUMNS = ["pi_time", "kern_time", "message"]
+AGE_COLUMNS: list[str] = []
+for _can_id, _tag in AGE_IDS:
+    AGE_COLUMNS.append(f"last_{_tag}")
+    AGE_COLUMNS.append(f"age_{_tag}_s")
+POWER_COLUMNS = ["input_v", "amp", "temp1", "temp2", "temp3", "batt_v"]
 STATUS_COLUMNS = [
     "pi_time",
     "uptime_s",
     "cpu_temp_c",
-    "input_v",
     "cpu_pct",
     "load1",
     "mem_used_pct",
     "throttled",
+    *POWER_COLUMNS,
     "can_link",
     "can_state",
     "can_tec",
@@ -254,6 +229,12 @@ STATUS_COLUMNS = [
     "can_tx",
     "can_tx_err",
     "can_tx_drop",
+    "clock",
+    "bitrate",
+    "sample_point",
+    "sjw",
+    "restart_ms",
+    "qlen",
     "psoc_tec",
     "psoc_rec",
     "psoc_busoff",
@@ -261,55 +242,208 @@ STATUS_COLUMNS = [
     "psoc_flags",
     "psoc_hw",
     "psoc_age_s",
+    *AGE_COLUMNS,
+]
+CAN_COLUMNS = [
+    "pi_time",
+    "kind",
+    "can_link",
+    "can_state",
+    "can_tec",
+    "can_rec",
+    "can_restarts",
+    "can_bus_errors",
+    "can_arbit_lost",
+    "can_error_warn",
+    "can_error_pass",
+    "can_bus_off",
+    "clock",
+    "bitrate",
+    "sample_point",
+    "sjw",
+    "restart_ms",
+    "qlen",
+    "err_cause",
+    "err_class",
+    "err_prot",
+    "err_loc",
+    "err_ctrl",
+    "err_tec",
+    "err_rec",
+    "err_data",
+    "app_unit",
+    "app_active",
+    "app_sub",
+    "app_since",
+    *POWER_COLUMNS,
+    *AGE_COLUMNS,
+    "detail",
 ]
 
 
-def prune_old(directory: Path, prefix: str, current: Path) -> None:
-    """同じ種類の CSV を、いまのファイルを含めて 100 件残す。"""
-    current_resolved = current.resolve()
-    others = []
-    for path in directory.glob(f"{prefix}_*.csv"):
-        if path.is_file() and path.resolve() != current_resolved:
-            others.append(path)
-    others.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for path in others[KEEP_FILES - 1:]:
+def pi_now() -> str:
+    """現地時刻。オフセット付き。ミリ秒まで。"""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def clock_text(raw: str) -> str:
+    matched = CLOCK_FACE.match(raw)
+    if matched is not None:
+        return f"{matched.group('h')}:{matched.group('m')}:{matched.group('s')}"
+    if raw in ("--/--/--", "--:--:--"):
+        return "--:--:--"
+    return raw
+
+
+def split_line(text: str) -> tuple[str, str]:
+    matched = PSOC_TIME.match(text.strip())
+    if matched is None:
+        return "", text.strip()
+    return clock_text(matched.group("psoc")), matched.group("rest")
+
+
+def bit_text(value: int, bits: tuple[tuple[int, str], ...]) -> str:
+    names = [label for bit, label in bits if value & bit]
+    return " ".join(names)
+
+
+def names_of(value: int, bits: tuple[tuple[int, str], ...]) -> list[str]:
+    return [label for bit, label in bits if value & bit]
+
+
+def err_cause(prot: list[str], loc: str, classes: list[str], ctrl: list[str]) -> str:
+    parts = list(prot)
+    if loc in ("CRC_SEQ", "CRC_DEL") and "CRC" not in parts:
+        parts.append("CRC")
+    if parts:
+        return "+".join(parts)
+    if "ACK" in classes or loc in ("ACK", "ACK_DEL"):
+        return "ACK"
+    if ctrl:
+        return "+".join(ctrl)
+    if "BUSOFF" in classes:
+        return "bus-off"
+    if classes:
+        return "+".join(classes)
+    return ""
+
+
+def decode_error(can_id: int, data: bytes) -> dict[str, str]:
+    err = can_id & CAN_ERR_MASK
+    classes = names_of(err, CLASS_BITS)
+    prot_byte = data[2] if len(data) > 2 else 0
+    loc_byte = data[3] if len(data) > 3 else 0
+    ctrl_byte = data[1] if len(data) > 1 else 0
+    prot = names_of(prot_byte, PROT_BITS) if err & CAN_ERR_PROT else []
+    loc = PROT_LOC.get(loc_byte, f"0x{loc_byte:02x}") if err & CAN_ERR_PROT or loc_byte else ""
+    if err & CAN_ERR_PROT and loc_byte == 0:
+        loc = "UNSPEC"
+    ctrl = names_of(ctrl_byte, CTRL_BITS) if err & CAN_ERR_CRTL else []
+    tec = str(data[6]) if len(data) > 6 else ""
+    rec = str(data[7]) if len(data) > 7 else ""
+    return {
+        "err_cause": err_cause(prot, loc, classes, ctrl),
+        "err_class": "+".join(classes),
+        "err_prot": "+".join(prot),
+        "err_loc": loc,
+        "err_ctrl": "+".join(ctrl),
+        "err_tec": tec,
+        "err_rec": rec,
+        "err_data": data.hex(),
+    }
+
+
+def change_key(row: dict[str, str]) -> tuple[str, ...]:
+    return tuple(row.get(key, "") for key in CHANGE_KEYS)
+
+
+def timing_key(row: dict[str, str]) -> tuple[str, ...]:
+    return tuple(row.get(key, "") for key in TIMING_KEYS)
+
+
+def timing_detail(row: dict[str, str]) -> str:
+    note = "PSoCは16tq サンプル0.875 SJW2"
+    restart = row.get("restart_ms", "")
+    if restart == "0":
+        note += "。restart-ms 0 は bus-off のあと自動復帰しない"
+    sample = row.get("sample_point", "")
+    sjw = row.get("sjw", "")
+    if sample and sjw:
         try:
-            path.unlink()
-        except OSError:
-            pass
+            same = abs(float(sample) - 0.875) < 0.001 and int(sjw) == 2
+        except ValueError:
+            same = False
+        note += "。サンプルとSJWはPSoCと同じ" if same else "。サンプルまたはSJWがPSoCと違う"
+    return note
 
 
-def open_uart_csv(directory: Path) -> tuple[object, csv.writer, Path]:
-    directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    path = directory / f"psoc_uart_{stamp}.csv"
-    handle = path.open("w", encoding="utf-8", newline="")
-    writer = csv.writer(handle)
-    writer.writerow(["pi_time", "psoc_time", "message"])
-    handle.flush()
-    os.fsync(handle.fileno())
-    prune_old(directory, "psoc_uart", path)
-    return handle, writer, path
+def port_block_reason(path: str) -> str:
+    base = path.replace("\\", "/").rstrip("/").split("/")[-1].lower()
+    if base in BLOCKED_TTY or base.startswith("ttyama"):
+        return "バッテリ監視のシリアルなので開かない"
+    if path and os.path.exists(path):
+        real = os.path.basename(os.path.realpath(path)).lower()
+        if real in BLOCKED_TTY or real.startswith("ttyama"):
+            return "バッテリ監視のシリアルなので開かない"
+    return ""
+
+
+def find_port() -> tuple[str, str]:
+    """(path, error)。by-id の CP210x だけ。ttyUSB や serial0 には落とさない。"""
+    by_id = Path("/dev/serial/by-id")
+    hits: list[Path] = []
+    if by_id.is_dir():
+        for path in sorted(by_id.iterdir()):
+            name = path.name.lower()
+            if "cp210" in name or "silicon_labs" in name or "siliconlabs" in name:
+                hits.append(path)
+    if len(hits) == 1:
+        chosen = str(hits[0])
+        reason = port_block_reason(chosen)
+        if reason:
+            return "", reason
+        return chosen, ""
+    if len(hits) > 1:
+        names = ", ".join(str(path) for path in hits)
+        return "", "CP210x が複数あります。--port で指定してください " + names
+    return "", "CP210x の by-id が見つかりません"
+
+
+def open_serial(path: str) -> int:
+    import termios
+
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    attrs = termios.tcgetattr(fd)
+    attrs[0] = 0
+    attrs[1] = 0
+    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+    attrs[3] = 0
+    attrs[6][termios.VMIN] = 1
+    attrs[6][termios.VTIME] = 0
+    attrs[4] = termios.B115200
+    attrs[5] = termios.B115200
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    termios.tcflush(fd, termios.TCIFLUSH)
+    return fd
+
+
+def take_lines(pending: bytearray) -> list[str]:
+    lines: list[str] = []
+    while True:
+        cut = pending.find(b"\n")
+        if cut < 0:
+            break
+        raw = pending[:cut]
+        del pending[: cut + 1]
+        text = raw.decode("utf-8", errors="replace").rstrip("\r").strip()
+        if text != "" and text != "LOG":
+            lines.append(text)
+    return lines
 
 
 def throttle_text(value: int) -> str:
     names = [label for bit, label in THROTTLE_BITS if value & bit]
     return " ".join(names) if names else "なし"
-
-
-def read_uptime() -> str:
-    try:
-        return Path("/proc/uptime").read_text().split()[0]
-    except (OSError, IndexError):
-        return ""
-
-
-def read_cpu_temp() -> str:
-    try:
-        milli = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip())
-    except (OSError, ValueError):
-        return ""
-    return f"{milli / 1000.0:.1f}"
 
 
 def parse_volts(text: str) -> str:
@@ -319,37 +453,70 @@ def parse_volts(text: str) -> str:
     return f"{float(matched.group(1)):.3f}"
 
 
-def read_input_voltage() -> str:
-    """5V 入力。Pi 4/5 の PMIC が返す EXT5V_V。"""
+def read_text(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def read_uptime() -> str:
+    text = read_text("/proc/uptime")
+    return text.split()[0] if text else ""
+
+
+def read_cpu_temp() -> str:
+    text = read_text("/sys/class/thermal/thermal_zone0/temp").strip()
+    try:
+        return f"{int(text) / 1000.0:.1f}"
+    except ValueError:
+        return ""
+
+
+def run_cmd(args: list[str], timeout: float) -> str:
     try:
         proc = subprocess.run(
-            ["vcgencmd", "pmic_read_adc", "EXT5V_V"],
+            args,
             capture_output=True,
             text=True,
-            timeout=0.4,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not proc.stdout:
         return ""
-    return parse_volts(proc.stdout)
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def read_input_voltage() -> str:
+    return parse_volts(run_cmd(["vcgencmd", "pmic_read_adc", "EXT5V_V"], 0.4))
+
+
+def read_batt(path: str) -> str:
+    if not path or port_block_reason(path):
+        return ""
+    text = read_text(path).strip()
+    if not text:
+        return ""
+    token = text.split()[0]
+    try:
+        return f"{float(token):.3f}"
+    except ValueError:
+        return ""
 
 
 def read_load1() -> str:
-    try:
-        return Path("/proc/loadavg").read_text().split()[0]
-    except (OSError, IndexError):
-        return ""
+    text = read_text("/proc/loadavg")
+    return text.split()[0] if text else ""
 
 
 def read_mem_used_pct() -> str:
-    info: dict[str, int] = {}
-    try:
-        lines = Path("/proc/meminfo").read_text().splitlines()
-    except OSError:
+    text = read_text("/proc/meminfo")
+    if not text:
         return ""
-    for line in lines:
+    info: dict[str, int] = {}
+    for line in text.splitlines():
         key, _, rest = line.partition(":")
         parts = rest.split()
         if parts:
@@ -365,10 +532,12 @@ def read_mem_used_pct() -> str:
 
 
 def read_cpu_jiffies() -> tuple[int, int] | None:
+    text = read_text("/proc/stat")
+    if not text:
+        return None
     try:
-        parts = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
-        nums = [int(item) for item in parts]
-    except (OSError, ValueError, IndexError):
+        nums = [int(item) for item in text.splitlines()[0].split()[1:]]
+    except ValueError:
         return None
     idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
     return sum(nums), idle
@@ -384,42 +553,23 @@ def cpu_percent(previous: tuple[int, int] | None, current: tuple[int, int] | Non
     return f"{(total - idle) * 100.0 / total:.1f}"
 
 
-def read_throttled() -> tuple[str, str]:
+def read_throttled() -> str:
+    text = run_cmd(["vcgencmd", "get_throttled"], 0.4).strip()
+    if "=" not in text:
+        return ""
+    raw = text.split("=")[-1].strip()
     try:
-        proc = subprocess.run(
-            ["vcgencmd", "get_throttled"],
-            capture_output=True,
-            text=True,
-            timeout=0.4,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "", ""
-    if proc.returncode != 0:
-        return "", ""
-    text = proc.stdout.strip().split("=")[-1].strip()
-    try:
-        value = int(text, 0)
+        value = int(raw, 0)
     except ValueError:
-        return "", ""
-    return f"0x{value:x}", throttle_text(value)
+        return ""
+    return f"0x{value:x} {throttle_text(value)}"
 
 
 def link_text(iface: str) -> str:
-    try:
-        proc = subprocess.run(
-            ["ip", "-details", "-statistics", "link", "show", iface],
-            capture_output=True,
-            text=True,
-            timeout=0.8,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return (proc.stdout or "") + (proc.stderr or "")
+    return run_cmd(["ip", "-details", "-statistics", "link", "show", iface], 0.25)
 
 
-def parse_can_link(text: str) -> dict[str, str]:
+def parse_can(text: str) -> dict[str, str]:
     row = {
         "can_link": "",
         "can_state": "",
@@ -437,6 +587,12 @@ def parse_can_link(text: str) -> dict[str, str]:
         "can_tx": "",
         "can_tx_err": "",
         "can_tx_drop": "",
+        "clock": "",
+        "bitrate": "",
+        "sample_point": "",
+        "sjw": "",
+        "restart_ms": "",
+        "qlen": "",
     }
     if not text:
         return row
@@ -444,13 +600,24 @@ def parse_can_link(text: str) -> dict[str, str]:
         row["can_link"] = "なし"
         return row
     first = text.split("\n", 1)[0]
-    if " state UP " in first:
+    if " state UP" in first:
         row["can_link"] = "UP"
-    elif " state DOWN " in first:
+    elif " state DOWN" in first:
         row["can_link"] = "DOWN"
-    state = RE_STATE.search(text)
-    if state:
-        row["can_state"] = state.group(1)
+    found = RE_STATE.search(text)
+    if found:
+        row["can_state"] = found.group(1)
+    for regex, key in (
+        (RE_BITRATE, "bitrate"),
+        (RE_CLOCK, "clock"),
+        (RE_SAMP, "sample_point"),
+        (RE_SJW, "sjw"),
+        (RE_RESTART, "restart_ms"),
+        (RE_QLEN, "qlen"),
+    ):
+        matched = regex.search(text)
+        if matched:
+            row[key] = matched.group(1)
     berr = RE_BERR.search(text)
     if berr:
         row["can_tec"] = berr.group(1)
@@ -476,146 +643,577 @@ def parse_can_link(text: str) -> dict[str, str]:
     return row
 
 
-def open_health_socket(iface: str) -> socket.socket | None:
+def set_can_opt(sock: socket.socket, opt: int, value: bytes) -> None:
+    try:
+        sock.setsockopt(SOL_CAN_RAW, opt, value)
+    except OSError:
+        sock.setsockopt(100, opt, value)
+
+
+def open_can_socket(iface: str, filters: bytes, err_mask: int | None) -> socket.socket | None:
     try:
         sock = socket.socket(AF_CAN, socket.SOCK_RAW, CAN_RAW)
         sock.setblocking(False)
-        filt = struct.pack("=II", ID_HEALTH, CAN_SFF_MASK)
-        sock.setsockopt(SOL_CAN_RAW, CAN_RAW_FILTER, filt)
+        if err_mask is not None:
+            set_can_opt(sock, CAN_RAW_ERR_FILTER, struct.pack("=I", err_mask))
+        set_can_opt(sock, CAN_RAW_FILTER, filters)
         sock.bind((iface,))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
     except OSError:
         return None
     return sock
 
 
-def take_health(sock: socket.socket | None) -> bytes | None:
-    if sock is None:
+def open_error_socket(iface: str) -> socket.socket | None:
+    filt = struct.pack("=II", CAN_ERR_FLAG, CAN_ERR_FLAG)
+    return open_can_socket(iface, filt, CAN_ERR_MASK)
+
+
+def open_id_socket(iface: str) -> socket.socket | None:
+    filt = b"".join(struct.pack("=II", can_id, CAN_SFF_MASK) for can_id in WATCH_IDS)
+    return open_can_socket(iface, filt, None)
+
+
+def unpack_frame(raw: bytes) -> tuple[int, int, bytes] | None:
+    if len(raw) < CAN_FRAME_SIZE:
         return None
-    latest: bytes | None = None
-    while True:
+    can_id, dlc, data = struct.unpack(CAN_FRAME_FMT, raw[:CAN_FRAME_SIZE])
+    return can_id, dlc, data[: min(dlc, 8)]
+
+
+def drain_frames(sock: socket.socket | None, limit: int = 500) -> list[tuple[int, int, bytes]]:
+    if sock is None:
+        return []
+    frames: list[tuple[int, int, bytes]] = []
+    while len(frames) < limit:
         try:
-            frame = sock.recv(CAN_FRAME_SIZE)
+            raw = sock.recv(CAN_FRAME_SIZE)
         except (BlockingIOError, InterruptedError):
             break
         except OSError:
             break
-        can_id, dlc, data = struct.unpack(CAN_FRAME_FMT, frame[:CAN_FRAME_SIZE])
-        if can_id & CAN_ERR_FLAG:
+        unpacked = unpack_frame(raw)
+        if unpacked is None:
             continue
-        if (can_id & CAN_SFF_MASK) == ID_HEALTH and dlc >= 6:
-            latest = data[:dlc]
-    return latest
+        can_id, dlc, data = unpacked
+        if can_id & 0x40000000:
+            continue
+        frames.append((can_id, dlc, data))
+    return frames
 
 
-def bit_text(value: int, bits: tuple[tuple[int, str], ...]) -> str:
-    names = [label for bit, label in bits if value & bit]
-    return " ".join(names) if names else "なし"
+def u16be(data: bytes, offset: int) -> int:
+    return (data[offset] << 8) | data[offset + 1]
 
 
-def health_fields(data: bytes | None, seen_at: float | None, now: float) -> dict[str, str]:
-    row = {
-        "psoc_tec": "",
-        "psoc_rec": "",
-        "psoc_busoff": "",
-        "psoc_attempts": "",
-        "psoc_flags": "",
-        "psoc_hw": "",
-        "psoc_age_s": "",
-    }
-    if data is None or seen_at is None:
-        return row
-    row["psoc_tec"] = str(data[0])
-    row["psoc_rec"] = str(data[1])
-    row["psoc_busoff"] = str((data[2] << 8) | data[3])
-    row["psoc_attempts"] = str(data[4])
-    row["psoc_flags"] = f"0x{data[5]:02x} {bit_text(data[5], PSOC_FLAG_BITS)}"
-    if len(data) >= 7:
-        row["psoc_hw"] = f"0x{data[6]:02x} {bit_text(data[6], PSOC_HW_BITS)}"
-    row["psoc_age_s"] = f"{now - seen_at:.1f}"
+class DayFile:
+    def __init__(self, directory: Path, prefix: str, columns: list[str], keep_days: int) -> None:
+        self.directory = directory
+        self.prefix = prefix
+        self.columns = columns
+        self.keep_days = keep_days
+        self.day = ""
+        self.handle = None
+        self.writer: csv.DictWriter | None = None
+        self.path: Path | None = None
+        self.dirty = False
+        self.last_sync = 0.0
+
+    def ensure(self) -> None:
+        day = datetime.now().astimezone().strftime("%Y%m%d")
+        if day == self.day and self.handle is not None:
+            return
+        self.close()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"{self.prefix}_{day}.csv"
+        new = (not path.exists()) or path.stat().st_size == 0
+        self.handle = path.open("a", encoding="utf-8", newline="")
+        self.writer = csv.DictWriter(
+            self.handle,
+            fieldnames=self.columns,
+            restval="",
+            extrasaction="ignore",
+        )
+        if new:
+            self.writer.writeheader()
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+        self.day = day
+        self.path = path
+        prune_days(self.directory, self.prefix, self.keep_days)
+
+    def write(self, row: dict[str, str], sync: bool = True) -> None:
+        self.ensure()
+        assert self.writer is not None and self.handle is not None
+        self.writer.writerow(row)
+        self.handle.flush()
+        if sync:
+            os.fsync(self.handle.fileno())
+            self.dirty = False
+            self.last_sync = time.monotonic()
+        else:
+            self.dirty = True
+
+    def sync_pending(self, now: float, interval: float = 0.2) -> None:
+        if not self.dirty or self.handle is None:
+            return
+        if (now - self.last_sync) < interval:
+            return
+        os.fsync(self.handle.fileno())
+        self.dirty = False
+        self.last_sync = now
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        self.handle.close()
+        self.handle = None
+        self.writer = None
+        self.day = ""
+
+
+def prune_days(directory: Path, prefix: str, keep_days: int) -> None:
+    cutoff = time.time() - keep_days * 86400
+    if not directory.is_dir():
+        return
+    for path in directory.glob(f"{prefix}_*.csv"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def blank_can() -> dict[str, str]:
+    return {key: "" for key in CAN_COLUMNS}
+
+
+def age_fields(seen: dict[int, tuple[float, str]], now: float) -> dict[str, str]:
+    row: dict[str, str] = {}
+    for can_id, tag in AGE_IDS:
+        hit = seen.get(can_id)
+        if hit is None:
+            row[f"last_{tag}"] = ""
+            row[f"age_{tag}_s"] = ""
+        else:
+            mono, stamp = hit
+            row[f"last_{tag}"] = stamp
+            row[f"age_{tag}_s"] = f"{now - mono:.1f}"
     return row
 
 
-def open_status_csv(directory: Path) -> tuple[object, csv.DictWriter, Path]:
-    directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    path = directory / f"pi_status_{stamp}.csv"
-    handle = path.open("w", encoding="utf-8", newline="")
-    writer = csv.DictWriter(handle, fieldnames=STATUS_COLUMNS)
-    writer.writeheader()
-    handle.flush()
-    os.fsync(handle.fileno())
-    prune_old(directory, "pi_status", path)
-    return handle, writer, path
+def kernel_keep(line: str) -> bool:
+    return KERN_KEEP.search(line) is not None
 
 
-def write_status(handle, writer: csv.DictWriter, row: dict[str, str]) -> None:
-    writer.writerow(row)
-    handle.flush()
-    os.fsync(handle.fileno())
+def split_kern(line: str) -> tuple[str, str]:
+    head, _, tail = line.partition(" ")
+    if "T" in head and any(ch.isdigit() for ch in head):
+        return head, tail
+    return "", line
 
 
-def sample_status(
-    iface: str,
-    previous_cpu: tuple[int, int] | None,
-    health: bytes | None,
-    health_at: float | None,
-) -> tuple[dict[str, str], tuple[int, int] | None]:
-    now = time.monotonic()
-    cpu = read_cpu_jiffies()
-    throttled, throttled_label = read_throttled()
-    row = {
-        "pi_time": pi_now(False),
-        "uptime_s": read_uptime(),
-        "cpu_temp_c": read_cpu_temp(),
-        "input_v": read_input_voltage(),
-        "cpu_pct": cpu_percent(previous_cpu, cpu),
-        "load1": read_load1(),
-        "mem_used_pct": read_mem_used_pct(),
-        "throttled": f"{throttled} {throttled_label}" if throttled else "",
+class KernelFollow:
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self.buf = b""
+        self.next_try = 0.0
+
+    def ensure(self, now: float) -> str:
+        if self.proc is not None and self.proc.poll() is None:
+            return ""
+        if now < self.next_try:
+            return ""
+        self.next_try = now + 5.0
+        try:
+            self.proc = subprocess.Popen(
+                ["journalctl", "-k", "-f", "-n", "20", "-o", "short-iso"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except OSError as exc:
+            self.proc = None
+            return f"journalctl を開始できません: {exc}"
+        if self.proc.stdout is None:
+            self.proc = None
+            return "journalctl の出力がありません"
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        return ""
+
+    def fileno(self) -> int | None:
+        if self.proc is None or self.proc.stdout is None or self.proc.poll() is not None:
+            return None
+        return self.proc.stdout.fileno()
+
+    def read_lines(self) -> list[str]:
+        fd = self.fileno()
+        if fd is None:
+            return []
+        try:
+            chunk = os.read(fd, 4096)
+        except (BlockingIOError, InterruptedError, OSError):
+            return []
+        if not chunk:
+            return []
+        self.buf += chunk
+        lines: list[str] = []
+        while b"\n" in self.buf:
+            raw, self.buf = self.buf.split(b"\n", 1)
+            text = raw.decode("utf-8", errors="replace").strip()
+            if text and kernel_keep(text):
+                lines.append(text)
+        return lines
+
+    def close(self) -> None:
+        if self.proc is None:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self.proc = None
+
+
+def read_app(unit: str) -> dict[str, str] | None:
+    text = run_cmd(
+        [
+            "systemctl",
+            "show",
+            unit,
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "ActiveEnterTimestamp",
+            "-p",
+            "InactiveEnterTimestamp",
+            "--no-pager",
+        ],
+        0.4,
+    )
+    if not text:
+        return None
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        fields[key] = value.strip()
+    if fields.get("LoadState") == "not-found":
+        return {"app_unit": unit, "app_active": "不明", "app_sub": "", "app_since": ""}
+    active = fields.get("ActiveState", "")
+    since = fields.get("ActiveEnterTimestamp", "") if active == "active" else fields.get(
+        "InactiveEnterTimestamp", ""
+    )
+    return {
+        "app_unit": unit,
+        "app_active": active,
+        "app_sub": fields.get("SubState", ""),
+        "app_since": since,
     }
-    row.update(parse_can_link(link_text(iface)))
-    row.update(health_fields(health, health_at, now))
-    return row, cpu
 
 
-def record_uart(handle, writer, text: str) -> None:
-    if text in ("LOGBEGIN", "LOGEND") or DUMP_LINE.match(text):
-        return
-    psoc_time, message = split_line(text)
-    pi_time = pi_now()
-    write_row(handle, writer, pi_time, psoc_time, message)
-    print(text, flush=True)
+def send_log_request(fd: int) -> None:
+    for byte in b"LOG\n":
+        try:
+            os.write(fd, bytes([byte]))
+        except OSError:
+            return
+        time.sleep(0.008)
+
+
+class UartLink:
+    def __init__(self, prefer: str) -> None:
+        self.prefer = prefer
+        self.fd: int | None = None
+        self.path = ""
+        self.pending = bytearray()
+        self.phase = "down"
+        self.next_try = 0.0
+        self.next_send = 0.0
+        self.begin_deadline = 0.0
+        self.end_deadline = 0.0
+        self.stored = 0
+        self.dump_since_sync = 0
+        self.last_fail = ""
+        self.next_fail_log = 0.0
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+        self.fd = None
+        self.phase = "down"
+        self.pending.clear()
+
+    def fail(self, book: DayFile, reason: str, now: float) -> None:
+        if reason == self.last_fail and now < self.next_fail_log:
+            return
+        self.last_fail = reason
+        self.next_fail_log = now + 60.0
+        book.write({"pi_time": pi_now(), "psoc_time": "", "message": "SERIAL " + reason})
+
+    def try_open(self, book: DayFile, now: float) -> None:
+        if self.fd is not None or now < self.next_try:
+            return
+        self.next_try = now + 2.0
+        path = self.prefer
+        if not path:
+            path, reason = find_port()
+            if not path:
+                self.fail(book, reason, now)
+                return
+        blocked = port_block_reason(path)
+        if blocked:
+            self.fail(book, blocked + " " + path, now)
+            return
+        try:
+            self.fd = open_serial(path)
+        except OSError as exc:
+            self.fd = None
+            self.fail(book, f"オープン失敗 {path}: {exc}", now)
+            return
+        self.path = path
+        self.phase = "hunt"
+        self.stored = 0
+        self.begin_deadline = time.monotonic() + 15.0
+        self.next_send = 0.0
+        self.last_fail = ""
+        book.write(
+            {
+                "pi_time": pi_now(),
+                "psoc_time": "",
+                "message": f"SERIAL 接続 {path}",
+            }
+        )
+
+    def pump(self, book: DayFile, now: float) -> None:
+        if self.fd is None:
+            return
+        if self.phase == "hunt" and now >= self.next_send:
+            send_log_request(self.fd)
+            self.next_send = now + 5.0
+        if self.phase == "hunt" and now >= self.begin_deadline:
+            book.write(
+                {
+                    "pi_time": pi_now(),
+                    "psoc_time": "",
+                    "message": "保存ログは取れませんでした。このあとの行だけ記録します",
+                }
+            )
+            self.phase = "live"
+        if self.phase == "dump" and now >= self.end_deadline:
+            book.write(
+                {
+                    "pi_time": pi_now(),
+                    "psoc_time": "",
+                    "message": f"保存ログの終わりが来ませんでした。取れた {self.stored} 件",
+                },
+                sync=True,
+            )
+            self.phase = "live"
+
+    def on_bytes(self, chunk: bytes, book: DayFile) -> None:
+        self.pending.extend(chunk)
+        for text in take_lines(self.pending):
+            self.on_line(text, book)
+
+    def on_line(self, text: str, book: DayFile) -> None:
+        now = time.monotonic()
+        if text == "LOGBEGIN":
+            self.phase = "dump"
+            self.end_deadline = now + 10.0
+            self.stored = 0
+            book.write({"pi_time": pi_now(), "psoc_time": "", "message": "保存ログ開始"}, sync=False)
+            return
+        if text == "LOGEND":
+            book.write(
+                {
+                    "pi_time": pi_now(),
+                    "psoc_time": "",
+                    "message": f"保存ログ終了 {self.stored} 件",
+                },
+                sync=True,
+            )
+            self.phase = "live"
+            return
+        matched = DUMP_LINE.match(text)
+        if self.phase == "dump" and matched is not None:
+            book.write(
+                {
+                    "pi_time": pi_now(),
+                    "psoc_time": matched.group("psoc"),
+                    "message": matched.group("rest"),
+                },
+                sync=False,
+            )
+            self.stored += 1
+            self.dump_since_sync += 1
+            self.end_deadline = now + 10.0
+            if self.dump_since_sync >= 20:
+                book.sync_pending(now, 0.0)
+                self.dump_since_sync = 0
+            return
+        psoc_time, message = split_line(text)
+        book.write({"pi_time": pi_now(), "psoc_time": psoc_time, "message": message})
+        print(text, flush=True)
+
+
+def self_test() -> int:
+    failed = 0
+
+    def check(cond: bool, label: str) -> None:
+        nonlocal failed
+        if not cond:
+            failed += 1
+            print("FAIL", label)
+
+    stamp = pi_now()
+    check(bool(re.search(r"T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$", stamp)), "pi_now " + stamp)
+    check(clock_text("11/12/45") == "11:12:45", "slash clock")
+    check(split_line("11/12/45 M1 運転可") == ("11:12:45", "M1 運転可"), "split")
+    check(port_block_reason("/dev/serial0") != "", "block serial0")
+    check(port_block_reason("/dev/serial/by-id/usb-Silicon_Labs_CP2102") == "", "allow cp210")
+
+    ack = decode_error(CAN_ERR_FLAG | CAN_ERR_ACK, bytes([0, 0, 0, 0x19, 0, 0, 1, 2]))
+    check(ack["err_cause"] == "ACK" and ack["err_loc"] == "ACK", "ack " + ack["err_cause"])
+    bit0 = decode_error(CAN_ERR_FLAG | CAN_ERR_PROT, bytes([0, 0, 0x08, 0x08, 0, 0, 9, 8]))
+    check(bit0["err_cause"] == "bit0+CRC" and bit0["err_loc"] == "CRC_SEQ", "bit0+crc " + bit0["err_cause"])
+    stuff = decode_error(CAN_ERR_FLAG | CAN_ERR_PROT, bytes([0, 0, 0x04, 0x0A, 0, 0, 3, 4]))
+    check(stuff["err_cause"] == "stuff" and stuff["err_loc"] == "DATA", "stuff")
+    form = decode_error(CAN_ERR_FLAG | CAN_ERR_PROT, bytes([0, 0, 0x02, 0x18, 0, 0, 5, 6]))
+    check(form["err_cause"] == "form+CRC", "form+crc " + form["err_cause"])
+
+    same = {"can_link": "UP", "can_state": "ERROR-ACTIVE", "can_tec": "0", "can_rx": "1"}
+    other = dict(same)
+    other["can_rx"] = "99"
+    changed = dict(same)
+    changed["can_state"] = "BUS-OFF"
+    check(change_key(same) == change_key(other), "rx is not a change")
+    check(change_key(same) != change_key(changed), "state is a change")
+    zero = {"sample_point": "0.875", "sjw": "2", "restart_ms": "0"}
+    check("自動復帰しない" in timing_detail(zero), "restart 0")
+    check("同じ" in timing_detail({"sample_point": "0.875", "sjw": "2", "restart_ms": "100"}), "match")
+
+    print("self-test", "ok" if failed == 0 else f"{failed} failed")
+    return 1 if failed else 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="PSoC UART とラズパイの状態を CSV に記録する")
-    parser.add_argument("--port", help="例: /dev/ttyUSB0。省略時は CP210x を探す")
-    parser.add_argument("--dir", default="log", help="この下に uart と status フォルダを作る")
+    if "--self-test" in sys.argv:
+        return self_test()
+
+    parser = argparse.ArgumentParser(description="PSoC UART と CAN の変化を CSV に記録する")
+    parser.add_argument("--port", default="", help="by-id の固定名。省略時は CP210x を探す")
+    parser.add_argument("--dir", default="log")
     parser.add_argument("--interval", type=float, default=10.0, help="状態の記録間隔（秒）")
+    parser.add_argument("--can-ms", type=float, default=150.0, help="CAN を見る間隔（ミリ秒）")
     parser.add_argument("--iface", default="can0")
+    parser.add_argument(
+        "--app-unit",
+        default=os.environ.get("PSOC_PI_LOG_APP_UNIT", ""),
+        help="起動と終了を残す systemd unit。未指定なら残さない",
+    )
+    parser.add_argument(
+        "--batt-file",
+        default=os.environ.get("PSOC_PI_LOG_BATT_FILE", ""),
+        help="バッテリ電圧が 1 行で書いてあるファイル。serial0 は開かない",
+    )
+    parser.add_argument("--keep-days", type=int, default=14)
+    parser.add_argument("--can-keep-days", type=int, default=30)
     args = parser.parse_args()
     if args.interval < 1.0:
         parser.error("--interval は 1 以上")
+    if not 50.0 <= args.can_ms <= 500.0:
+        parser.error("--can-ms は 50 から 500")
+    if args.keep_days < 1 or args.can_keep_days < 1:
+        parser.error("保持日数は 1 以上")
 
     root = Path(args.dir)
-    port = args.port or find_port()
-    uart_handle, uart_writer, uart_path = open_uart_csv(root / "uart")
-    status_handle, status_writer, status_path = open_status_csv(root / "status")
-    print(f"UART: {uart_path}", flush=True)
-    print(f"状態: {status_path}", flush=True)
-    print(f"ポート: {port}  115200 8N1  状態は {args.interval:.0f} 秒ごと", flush=True)
+    uart_book = DayFile(root / "uart", "psoc_uart", UART_COLUMNS, args.keep_days)
+    status_book = DayFile(root / "status", "pi_status", STATUS_COLUMNS, args.keep_days)
+    can_book = DayFile(root / "can", "can_event", CAN_COLUMNS, args.can_keep_days)
+    kern_book = DayFile(root / "kernel", "kern", KERN_COLUMNS, args.can_keep_days)
+    uart_book.ensure()
+    can_book.ensure()
+    print(f"UART: {uart_book.path}", flush=True)
+    print(f"状態: {status_book.directory}", flush=True)
+    print(f"CAN: {can_book.path}", flush=True)
+    print(
+        f"状態は {args.interval:.0f} 秒、CAN は {args.can_ms:.0f} ms。"
+        " シリアルは by-id。止めるときは Ctrl+C",
+        flush=True,
+    )
+    uart_book.write(
+        {
+            "pi_time": pi_now(),
+            "psoc_time": "",
+            "message": "記録開始" + (f" port={args.port}" if args.port else ""),
+        }
+    )
 
-    fd = open_serial(port)
-    health_sock = open_health_socket(args.iface)
+    link = UartLink(args.port)
+    kernel = KernelFollow()
+    err_sock: socket.socket | None = None
+    id_sock: socket.socket | None = None
+    next_sock = 0.0
+    sock_failed = False
+    seen: dict[int, tuple[float, str]] = {}
     health: bytes | None = None
     health_at: float | None = None
+    power = {"input_v": "", "amp": "", "temp1": "", "temp2": "", "temp3": "", "batt_v": ""}
+    can_now: dict[str, str] = parse_can("")
+    prev_change: tuple[str, ...] | None = None
+    prev_timing: tuple[str, ...] | None = None
+    prev_app: dict[str, str] | None = None
     cpu = read_cpu_jiffies()
-    pending, early = pull_stored(fd, uart_handle, uart_writer)
-    print("このあとの行を記録します。止めるときは Ctrl+C", flush=True)
-    for pi_time, psoc_time, message in early:
-        write_row(uart_handle, uart_writer, pi_time, psoc_time, message)
-    next_status = time.monotonic() + 0.2
-    watch = [fd] if health_sock is None else [fd, health_sock]
+    next_can = 0.0
+    next_status = 0.0
+    next_app = 0.0
+    next_power = 0.0
+    can_interval = args.can_ms / 1000.0
+
+    def power_now() -> dict[str, str]:
+        return dict(power)
+
+    def context(kind: str) -> dict[str, str]:
+        row = blank_can()
+        row["pi_time"] = pi_now()
+        row["kind"] = kind
+        row.update({key: can_now.get(key, "") for key in CHANGE_KEYS})
+        row.update({key: can_now.get(key, "") for key in TIMING_KEYS})
+        row.update(power_now())
+        row.update(age_fields(seen, time.monotonic()))
+        return row
+
+    def pull_can() -> None:
+        nonlocal health, health_at
+        if err_sock is not None:
+            for can_id, _dlc, data in drain_frames(err_sock):
+                if not (can_id & CAN_ERR_FLAG):
+                    continue
+                row = context("error")
+                row.update(decode_error(can_id, data))
+                can_book.write(row, sync=False)
+        if id_sock is not None:
+            for can_id, dlc, data in drain_frames(id_sock):
+                if can_id & CAN_ERR_FLAG:
+                    continue
+                sid = can_id & CAN_SFF_MASK
+                if sid in {item[0] for item in AGE_IDS} or sid == 0x092:
+                    seen[sid] = (time.monotonic(), pi_now())
+                if sid == 0x090 and dlc >= 8:
+                    power["amp"] = str(u16be(data, 0))
+                    power["temp1"] = str(u16be(data, 2))
+                    power["temp2"] = str(u16be(data, 4))
+                    power["temp3"] = str(u16be(data, 6))
+                elif sid == 0x092 and dlc >= 6:
+                    health = data
+                    health_at = time.monotonic()
 
     def request_stop(signum, frame):
         raise KeyboardInterrupt
@@ -625,43 +1223,145 @@ def main() -> int:
     try:
         while True:
             now = time.monotonic()
-            if health_sock is not None:
-                latest = take_health(health_sock)
-                if latest is not None:
-                    health = latest
-                    health_at = now
+            pull_can()
+            link.try_open(uart_book, now)
+            link.pump(uart_book, now)
+            kern_note = kernel.ensure(now)
+            if kern_note:
+                kern_book.write({"pi_time": pi_now(), "kern_time": "", "message": kern_note})
+                kern_note = ""
+            if (err_sock is None or id_sock is None) and now >= next_sock:
+                next_sock = now + 5.0
+                if err_sock is None:
+                    err_sock = open_error_socket(args.iface)
+                if id_sock is None:
+                    id_sock = open_id_socket(args.iface)
+                opened = err_sock is not None and id_sock is not None
+                if not opened and not sock_failed:
+                    row = context("state")
+                    row["detail"] = "CAN ソケットを開けません。ip の状態だけ残します"
+                    can_book.write(row)
+                sock_failed = not opened
+
+            if now >= next_can:
+                can_now = parse_can(link_text(args.iface))
+                timing = timing_key(can_now)
+                if timing != prev_timing and any(timing):
+                    row = context("timing")
+                    row["detail"] = timing_detail(can_now)
+                    can_book.write(row)
+                    prev_timing = timing
+                current = change_key(can_now)
+                if current != prev_change and any(current):
+                    if now >= next_power:
+                        power["input_v"] = read_input_voltage()
+                        power["batt_v"] = read_batt(args.batt_file)
+                        next_power = now + 1.0
+                    row = context("state")
+                    can_book.write(row)
+                    prev_change = current
+                    print(
+                        f"{row['pi_time']}  {row['can_link']} {row['can_state']} "
+                        f"tec={row['can_tec']} rec={row['can_rec']} busoff={row['can_bus_off']}",
+                        flush=True,
+                    )
+                next_can = time.monotonic() + can_interval
+                pull_can()
+
+            if args.app_unit and now >= next_app:
+                app = read_app(args.app_unit)
+                if app is not None and app != prev_app:
+                    row = context("app")
+                    row.update(app)
+                    can_book.write(row)
+                    prev_app = app
+                next_app = time.monotonic() + 1.0
+
             if now >= next_status:
-                row, cpu = sample_status(args.iface, cpu, health, health_at)
-                write_status(status_handle, status_writer, row)
-                print(
-                    f"{row['pi_time']}  temp={row['cpu_temp_c']}  input={row['input_v']}V  "
-                    f"cpu={row['cpu_pct']}%  can={row['can_link']} {row['can_state']} "
-                    f"tec={row['can_tec']} rec={row['can_rec']} "
-                    f"buserr={row['can_bus_errors']} rxerr={row['can_rx_err']} txerr={row['can_tx_err']} "
-                    f"psoc={row['psoc_flags']}",
-                    flush=True,
-                )
+                fresh = read_cpu_jiffies()
+                power["input_v"] = read_input_voltage()
+                power["batt_v"] = read_batt(args.batt_file)
+                next_power = now + 1.0
+                throttled = read_throttled()
+                row = {
+                    "pi_time": pi_now(),
+                    "uptime_s": read_uptime(),
+                    "cpu_temp_c": read_cpu_temp(),
+                    "cpu_pct": cpu_percent(cpu, fresh),
+                    "load1": read_load1(),
+                    "mem_used_pct": read_mem_used_pct(),
+                    "throttled": throttled,
+                }
+                row.update(power_now())
+                row.update(can_now)
+                if health is not None and health_at is not None and len(health) >= 6:
+                    row["psoc_tec"] = str(health[0])
+                    row["psoc_rec"] = str(health[1])
+                    row["psoc_busoff"] = str((health[2] << 8) | health[3])
+                    row["psoc_attempts"] = str(health[4])
+                    flags = bit_text(health[5], PSOC_FLAG_BITS) or "なし"
+                    row["psoc_flags"] = f"0x{health[5]:02x} {flags}"
+                    if len(health) >= 7:
+                        hw = bit_text(health[6], PSOC_HW_BITS) or "なし"
+                        row["psoc_hw"] = f"0x{health[6]:02x} {hw}"
+                    row["psoc_age_s"] = f"{time.monotonic() - health_at:.1f}"
+                row.update(age_fields(seen, time.monotonic()))
+                status_book.write(row)
+                cpu = fresh
                 next_status = time.monotonic() + args.interval
-            timeout = max(0.0, next_status - time.monotonic())
-            ready, _, _ = select.select(watch, [], [], timeout)
-            if fd not in ready:
-                continue
-            chunk = os.read(fd, 256)
-            if not chunk:
-                continue
-            pending.extend(chunk)
-            for text in take_lines(pending):
-                record_uart(uart_handle, uart_writer, text)
+
+            for text in kernel.read_lines():
+                kern_time, message = split_kern(text)
+                kern_book.write(
+                    {"pi_time": pi_now(), "kern_time": kern_time, "message": message},
+                    sync=False,
+                )
+
+            while link.fd is not None:
+                try:
+                    chunk = os.read(link.fd, 4096)
+                except BlockingIOError:
+                    break
+                except OSError as exc:
+                    link.close()
+                    link.fail(uart_book, f"切断: {exc}", time.monotonic())
+                    break
+                if not chunk:
+                    link.close()
+                    link.fail(uart_book, "切断: 読み出しが終わりました", time.monotonic())
+                    break
+                link.on_bytes(chunk, uart_book)
+
+            uart_book.sync_pending(now)
+            can_book.sync_pending(now)
+            kern_book.sync_pending(now)
+
+            watch: list[int] = []
+            if link.fd is not None:
+                watch.append(link.fd)
+            kern_fd = kernel.fileno()
+            if kern_fd is not None:
+                watch.append(kern_fd)
+            if err_sock is not None:
+                watch.append(err_sock.fileno())
+            if id_sock is not None:
+                watch.append(id_sock.fileno())
+            soon = min(next_can, next_status, link.next_try if link.fd is None else next_can)
+            timeout = max(0.0, min(0.2, soon - time.monotonic()))
+            if watch:
+                select.select(watch, [], [], timeout)
+            else:
+                time.sleep(timeout)
     except KeyboardInterrupt:
         return 0
     finally:
-        for handle in (uart_handle, status_handle):
-            handle.flush()
-            os.fsync(handle.fileno())
-            handle.close()
-        os.close(fd)
-        if health_sock is not None:
-            health_sock.close()
+        link.close()
+        kernel.close()
+        for sock in (err_sock, id_sock):
+            if sock is not None:
+                sock.close()
+        for book in (uart_book, status_book, can_book, kern_book):
+            book.close()
 
 
 if __name__ == "__main__":
