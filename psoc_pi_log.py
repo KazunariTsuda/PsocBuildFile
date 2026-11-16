@@ -2,12 +2,12 @@
 """PSoC の UART と、ラズパイの CAN・電源・カーネルを CSV に残す。
 
 走行アプリとは別プロセスで動かす。アプリが bus-off で止まっても記録は続ける。
-起動のたびにファイルは増やさず、日付ごとに追記する。
+起動のたびに、開始時刻の付いたファイルを新しく作る。
 
-  log/uart/psoc_uart_YYYYMMDD.csv      受信した行。14 日
-  log/status/pi_status_YYYYMMDD.csv    10 秒ごとの状態。14 日
-  log/can/can_event_YYYYMMDD.csv       ビットタイミング、CAN の変化、エラーフレーム、アプリの起動と終了。30 日
-  log/kernel/kern_YYYYMMDD.csv         journalctl -k のうち CAN / SPI。30 日
+  log/uart/psoc_uart_YYYYMMDD_HHMMSS.csv      受信した行。14 日
+  log/status/pi_status_YYYYMMDD_HHMMSS.csv    10 秒ごとの状態。14 日
+  log/can/can_event_YYYYMMDD_HHMMSS.csv       ビットタイミング、CAN の変化、エラーフレーム、アプリの起動と終了。30 日
+  log/kernel/kern_YYYYMMDD_HHMMSS.csv         journalctl -k のうち CAN / SPI。30 日
 
 pi_time は現地時刻にオフセットを付けた ISO 時刻。ミリ秒まで。
 UART は届いた順に書く。並べるときは pi_time を使う。
@@ -142,6 +142,7 @@ RE_SJW = re.compile(r"\bsjw\s+(\d+)")
 RE_RESTART = re.compile(r"restart-ms\s+(\d+)")
 RE_QLEN = re.compile(r"\bqlen\s+(\d+)")
 RE_VOLT = re.compile(r"=\s*([0-9]+(?:\.[0-9]+)?)V")
+RE_CPU_TEMP = re.compile(r"temp=([0-9]+(?:\.[0-9]+)?)")
 RE_STATS = re.compile(
     r"re-started\s+bus-errors\s+arbit-lost\s+error-warn\s+error-pass\s+bus-off\s+"
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
@@ -197,7 +198,51 @@ CHANGE_KEYS = (
 )
 TIMING_KEYS = ("clock", "bitrate", "sample_point", "sjw", "restart_ms", "qlen")
 
-UART_COLUMNS = ["pi_time", "psoc_time", "message"]
+UART_COLUMNS = [
+    "pi_time",
+    "psoc_time",
+    "kind",
+    "message",
+    "m1_sw",
+    "m1_state",
+    "m1_remote",
+    "m1_target",
+    "m1_speed",
+    "m1_limit",
+    "m1_warn",
+    "m1_trq",
+    "m1_hwto",
+    "m1_son",
+    "m1_stop",
+    "m2_sw",
+    "m2_state",
+    "m2_remote",
+    "m2_target",
+    "m2_speed",
+    "m2_limit",
+    "m2_warn",
+    "m2_trq",
+    "m2_hwto",
+    "m2_son",
+    "m2_stop",
+    "nocmd_s",
+    "corr_ms",
+    "m1_silent_s",
+    "m2_silent_s",
+    "can_tec",
+    "can_rec",
+    "can_es",
+    "can_class",
+    "can_ack",
+    "can_bit",
+    "can_stuff",
+    "can_form",
+    "can_crc",
+    "can_arb",
+    "can_lost",
+    "can_txfail",
+    "can_stop_s",
+]
 KERN_COLUMNS = ["pi_time", "kern_time", "message"]
 AGE_COLUMNS: list[str] = []
 for _can_id, _tag in AGE_IDS:
@@ -299,7 +344,104 @@ def split_line(text: str) -> tuple[str, str]:
     matched = PSOC_TIME.match(text.strip())
     if matched is None:
         return "", text.strip()
-    return clock_text(matched.group("psoc")), matched.group("rest")
+    rest = matched.group("rest")
+    if rest.startswith(","):
+        rest = rest[1:]
+    return clock_text(matched.group("psoc")), rest
+
+
+def cia_state(sw: int) -> str:
+    if (sw & 0x004F) == 0x0000:
+        return "準備前"
+    if (sw & 0x004F) == 0x0040:
+        return "励磁不可"
+    if (sw & 0x006F) == 0x0021:
+        return "準備完了"
+    if (sw & 0x006F) == 0x0023:
+        return "スイッチオン"
+    if (sw & 0x006F) == 0x0027:
+        return "運転可"
+    if (sw & 0x006F) == 0x0007:
+        return "急停止"
+    if (sw & 0x004F) == 0x000F:
+        return "異常処理"
+    if (sw & 0x004F) == 0x0008:
+        return "異常"
+    return "不明"
+
+
+def din_text(din: str, bit: int) -> str:
+    if din == "":
+        return "不明"
+    value = int(din, 16)
+    return "入" if (value & (1 << bit)) != 0 else "切"
+
+
+def motor_fields(prefix: str, sw_text: str, trq_text: str, din: str) -> dict[str, str]:
+    sw = int(sw_text, 16) if sw_text else 0
+    return {
+        f"{prefix}_sw": sw_text,
+        f"{prefix}_state": cia_state(sw) if sw_text else "",
+        f"{prefix}_remote": ("遠隔" if (sw & 0x0200) != 0 else "ローカル") if sw_text else "",
+        f"{prefix}_target": ("到達" if (sw & 0x0400) != 0 else "未到達") if sw_text else "",
+        f"{prefix}_speed": ("速度0" if (sw & 0x1000) != 0 else "回転") if sw_text else "",
+        f"{prefix}_limit": "内部制限" if sw_text and (sw & 0x0800) != 0 else "",
+        f"{prefix}_warn": "警告" if sw_text and (sw & 0x0080) != 0 else "",
+        f"{prefix}_trq": trq_text if trq_text != "" else "不明",
+        f"{prefix}_hwto": din_text(din, 3),
+        f"{prefix}_son": din_text(din, 16),
+        f"{prefix}_stop": din_text(din, 21),
+    }
+
+
+def blank_uart() -> dict[str, str]:
+    return {name: "" for name in UART_COLUMNS}
+
+
+def uart_note(message: str) -> dict[str, str]:
+    row = blank_uart()
+    row["pi_time"] = pi_now()
+    row["kind"] = "note"
+    row["message"] = message
+    return row
+
+
+def uart_from_line(psoc_time: str, rest: str, kind_hint: str = "") -> dict[str, str]:
+    row = blank_uart()
+    row["pi_time"] = pi_now()
+    row["psoc_time"] = psoc_time
+    row["message"] = rest
+    parts = rest.split(",")
+    tag = parts[0] if parts else ""
+    if tag == "M" and len(parts) >= 11:
+        row["kind"] = "M"
+        row.update(motor_fields("m1", parts[1], parts[2], parts[3]))
+        row.update(motor_fields("m2", parts[4], parts[5], parts[6]))
+        row["nocmd_s"] = parts[7]
+        row["corr_ms"] = parts[8]
+        row["m1_silent_s"] = parts[9]
+        row["m2_silent_s"] = parts[10]
+    elif tag == "CANOFF" and len(parts) >= 4:
+        row["kind"] = "CANOFF"
+        row["can_tec"] = parts[1]
+        row["can_rec"] = parts[2]
+        row["can_es"] = parts[3]
+    elif tag == "CANPASV" and len(parts) >= 2:
+        row["kind"] = "CANPASV"
+        row["can_class"] = parts[1]
+    elif tag == "CANERR" and len(parts) >= 8:
+        row["kind"] = "CANERR"
+        keys = ("can_ack", "can_bit", "can_stuff", "can_form", "can_crc", "can_arb", "can_lost")
+        for key, value in zip(keys, parts[1:8]):
+            row[key] = value
+        if len(parts) > 8:
+            row["can_txfail"] = " ".join(parts[8:])
+    elif tag == "CANSTOP" and len(parts) >= 2:
+        row["kind"] = "CANSTOP"
+        row["can_stop_s"] = parts[1]
+    else:
+        row["kind"] = kind_hint or "event"
+    return row
 
 
 def bit_text(value: int, bits: tuple[tuple[int, str], ...]) -> str:
@@ -465,12 +607,21 @@ def read_uptime() -> str:
     return text.split()[0] if text else ""
 
 
-def read_cpu_temp() -> str:
-    text = read_text("/sys/class/thermal/thermal_zone0/temp").strip()
+def parse_cpu_temp(command_text: str, sysfs_text: str) -> str:
+    """vcgencmd measure_temp の値。コマンドが無ければ sysfs の同じ温度。"""
+    matched = RE_CPU_TEMP.search(command_text)
+    if matched is not None:
+        return f"{float(matched.group(1)):.1f}"
     try:
-        return f"{int(text) / 1000.0:.1f}"
+        return f"{int(sysfs_text.strip()) / 1000.0:.1f}"
     except ValueError:
         return ""
+
+
+def read_cpu_temp() -> str:
+    command = run_cmd(["vcgencmd", "measure_temp"], 0.4)
+    sysfs = read_text("/sys/class/thermal/thermal_zone0/temp")
+    return parse_cpu_temp(command, sysfs)
 
 
 def run_cmd(args: list[str], timeout: float) -> str:
@@ -618,6 +769,7 @@ def parse_can(text: str) -> dict[str, str]:
         matched = regex.search(text)
         if matched:
             row[key] = matched.group(1)
+    # berr-reporting は非対応なので、この行は通常出ない。出たときだけ使う。
     berr = RE_BERR.search(text)
     if berr:
         row["can_tec"] = berr.group(1)
@@ -707,12 +859,19 @@ def u16be(data: bytes, offset: int) -> int:
 
 
 class DayFile:
-    def __init__(self, directory: Path, prefix: str, columns: list[str], keep_days: int) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        prefix: str,
+        columns: list[str],
+        keep_days: int,
+        stamp: str,
+    ) -> None:
         self.directory = directory
         self.prefix = prefix
         self.columns = columns
         self.keep_days = keep_days
-        self.day = ""
+        self.stamp = stamp
         self.handle = None
         self.writer: csv.DictWriter | None = None
         self.path: Path | None = None
@@ -720,12 +879,10 @@ class DayFile:
         self.last_sync = 0.0
 
     def ensure(self) -> None:
-        day = datetime.now().astimezone().strftime("%Y%m%d")
-        if day == self.day and self.handle is not None:
+        if self.handle is not None:
             return
-        self.close()
         self.directory.mkdir(parents=True, exist_ok=True)
-        path = self.directory / f"{self.prefix}_{day}.csv"
+        path = self._compatible_path(self.directory / f"{self.prefix}_{self.stamp}.csv")
         new = (not path.exists()) or path.stat().st_size == 0
         self.handle = path.open("a", encoding="utf-8", newline="")
         self.writer = csv.DictWriter(
@@ -738,9 +895,17 @@ class DayFile:
             self.writer.writeheader()
             self.handle.flush()
             os.fsync(self.handle.fileno())
-        self.day = day
         self.path = path
         prune_days(self.directory, self.prefix, self.keep_days)
+
+    def _compatible_path(self, path: Path) -> Path:
+        if (not path.exists()) or path.stat().st_size == 0:
+            return path
+        with path.open(encoding="utf-8") as handle:
+            header = handle.readline().rstrip("\r\n")
+        if header == ",".join(self.columns):
+            return path
+        return path.with_name(f"{path.stem}_v2{path.suffix}")
 
     def write(self, row: dict[str, str], sync: bool = True) -> None:
         self.ensure()
@@ -771,7 +936,6 @@ class DayFile:
         self.handle.close()
         self.handle = None
         self.writer = None
-        self.day = ""
 
 
 def prune_days(directory: Path, prefix: str, keep_days: int) -> None:
@@ -955,7 +1119,7 @@ class UartLink:
             return
         self.last_fail = reason
         self.next_fail_log = now + 60.0
-        book.write({"pi_time": pi_now(), "psoc_time": "", "message": "SERIAL " + reason})
+        book.write(uart_note("SERIAL " + reason))
 
     def try_open(self, book: DayFile, now: float) -> None:
         if self.fd is not None or now < self.next_try:
@@ -983,13 +1147,7 @@ class UartLink:
         self.begin_deadline = time.monotonic() + 15.0
         self.next_send = 0.0
         self.last_fail = ""
-        book.write(
-            {
-                "pi_time": pi_now(),
-                "psoc_time": "",
-                "message": f"SERIAL 接続 {path}",
-            }
-        )
+        book.write(uart_note(f"SERIAL 接続 {path}"))
 
     def pump(self, book: DayFile, now: float) -> None:
         if self.fd is None:
@@ -998,21 +1156,11 @@ class UartLink:
             send_log_request(self.fd)
             self.next_send = now + 5.0
         if self.phase == "hunt" and now >= self.begin_deadline:
-            book.write(
-                {
-                    "pi_time": pi_now(),
-                    "psoc_time": "",
-                    "message": "保存ログは取れませんでした。このあとの行だけ記録します",
-                }
-            )
+            book.write(uart_note("保存ログは取れませんでした。このあとの行だけ記録します"))
             self.phase = "live"
         if self.phase == "dump" and now >= self.end_deadline:
             book.write(
-                {
-                    "pi_time": pi_now(),
-                    "psoc_time": "",
-                    "message": f"保存ログの終わりが来ませんでした。取れた {self.stored} 件",
-                },
+                uart_note(f"保存ログの終わりが来ませんでした。取れた {self.stored} 件"),
                 sync=True,
             )
             self.phase = "live"
@@ -1028,27 +1176,16 @@ class UartLink:
             self.phase = "dump"
             self.end_deadline = now + 10.0
             self.stored = 0
-            book.write({"pi_time": pi_now(), "psoc_time": "", "message": "保存ログ開始"}, sync=False)
+            book.write(uart_note("保存ログ開始"), sync=False)
             return
         if text == "LOGEND":
-            book.write(
-                {
-                    "pi_time": pi_now(),
-                    "psoc_time": "",
-                    "message": f"保存ログ終了 {self.stored} 件",
-                },
-                sync=True,
-            )
+            book.write(uart_note(f"保存ログ終了 {self.stored} 件"), sync=True)
             self.phase = "live"
             return
         matched = DUMP_LINE.match(text)
         if self.phase == "dump" and matched is not None:
             book.write(
-                {
-                    "pi_time": pi_now(),
-                    "psoc_time": matched.group("psoc"),
-                    "message": matched.group("rest"),
-                },
+                uart_from_line(matched.group("psoc"), matched.group("rest"), "dump"),
                 sync=False,
             )
             self.stored += 1
@@ -1059,7 +1196,7 @@ class UartLink:
                 self.dump_since_sync = 0
             return
         psoc_time, message = split_line(text)
-        book.write({"pi_time": pi_now(), "psoc_time": psoc_time, "message": message})
+        book.write(uart_from_line(psoc_time, message))
         print(text, flush=True)
 
 
@@ -1076,6 +1213,23 @@ def self_test() -> int:
     check(bool(re.search(r"T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$", stamp)), "pi_now " + stamp)
     check(clock_text("11/12/45") == "11:12:45", "slash clock")
     check(split_line("11/12/45 M1 運転可") == ("11:12:45", "M1 運転可"), "split")
+    check(split_line("11:12:45,START 1") == ("11:12:45", "START 1"), "split comma")
+    motor = uart_from_line(
+        "17:21:00",
+        "M,2f27,-17,00000008,0040,,,101,0,1,2",
+    )
+    check(motor["kind"] == "M", "motor kind")
+    check(motor["m1_state"] == "運転可" and motor["m1_remote"] == "遠隔", "m1 state")
+    check(motor["m1_target"] == "到達" and motor["m1_speed"] == "回転", "m1 bits")
+    check(motor["m1_limit"] == "内部制限" and motor["m1_trq"] == "-17", "m1 trq")
+    check(motor["m1_hwto"] == "入" and motor["m1_son"] == "切" and motor["m1_stop"] == "切", "m1 din")
+    check(motor["m2_state"] == "励磁不可" and motor["m2_trq"] == "不明", "m2 missing trq")
+    check(motor["m2_hwto"] == "不明" and motor["nocmd_s"] == "101", "m2 din empty")
+    check(motor["m1_silent_s"] == "1" and motor["m2_silent_s"] == "2", "silence")
+    can = uart_from_line("17:21:00", "CANERR,0,0,0,0,0,2,0,181=3")
+    check(can["can_arb"] == "2" and can["can_txfail"] == "181=3", "canerr")
+    check(parse_cpu_temp("temp=48.2'C\n", "") == "48.2", "vcgencmd temp")
+    check(parse_cpu_temp("", "51234\n") == "51.2", "sysfs temp")
     check(port_block_reason("/dev/serial0") != "", "block serial0")
     check(port_block_reason("/dev/serial/by-id/usb-Silicon_Labs_CP2102") == "", "allow cp210")
 
@@ -1134,10 +1288,11 @@ def main() -> int:
         parser.error("保持日数は 1 以上")
 
     root = Path(args.dir)
-    uart_book = DayFile(root / "uart", "psoc_uart", UART_COLUMNS, args.keep_days)
-    status_book = DayFile(root / "status", "pi_status", STATUS_COLUMNS, args.keep_days)
-    can_book = DayFile(root / "can", "can_event", CAN_COLUMNS, args.can_keep_days)
-    kern_book = DayFile(root / "kernel", "kern", KERN_COLUMNS, args.can_keep_days)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    uart_book = DayFile(root / "uart", "psoc_uart", UART_COLUMNS, args.keep_days, stamp)
+    status_book = DayFile(root / "status", "pi_status", STATUS_COLUMNS, args.keep_days, stamp)
+    can_book = DayFile(root / "can", "can_event", CAN_COLUMNS, args.can_keep_days, stamp)
+    kern_book = DayFile(root / "kernel", "kern", KERN_COLUMNS, args.can_keep_days, stamp)
     uart_book.ensure()
     can_book.ensure()
     print(f"UART: {uart_book.path}", flush=True)
@@ -1148,13 +1303,7 @@ def main() -> int:
         " シリアルは by-id。止めるときは Ctrl+C",
         flush=True,
     )
-    uart_book.write(
-        {
-            "pi_time": pi_now(),
-            "psoc_time": "",
-            "message": "記録開始" + (f" port={args.port}" if args.port else ""),
-        }
-    )
+    uart_book.write(uart_note("記録開始" + (f" port={args.port}" if args.port else "")))
 
     link = UartLink(args.port)
     kernel = KernelFollow()
@@ -1167,6 +1316,8 @@ def main() -> int:
     health_at: float | None = None
     power = {"input_v": "", "amp": "", "temp1": "", "temp2": "", "temp3": "", "batt_v": ""}
     can_now: dict[str, str] = parse_can("")
+    frame_tec = ""
+    frame_rec = ""
     prev_change: tuple[str, ...] | None = None
     prev_timing: tuple[str, ...] | None = None
     prev_app: dict[str, str] | None = None
@@ -1191,13 +1342,17 @@ def main() -> int:
         return row
 
     def pull_can() -> None:
-        nonlocal health, health_at
+        nonlocal health, health_at, frame_tec, frame_rec
         if err_sock is not None:
             for can_id, _dlc, data in drain_frames(err_sock):
                 if not (can_id & CAN_ERR_FLAG):
                     continue
+                decoded = decode_error(can_id, data)
+                if decoded["err_tec"] != "":
+                    frame_tec = decoded["err_tec"]
+                    frame_rec = decoded["err_rec"]
                 row = context("error")
-                row.update(decode_error(can_id, data))
+                row.update(decoded)
                 can_book.write(row, sync=False)
         if id_sock is not None:
             for can_id, dlc, data in drain_frames(id_sock):
@@ -1245,6 +1400,9 @@ def main() -> int:
 
             if now >= next_can:
                 can_now = parse_can(link_text(args.iface))
+                if can_now["can_tec"] == "" and frame_tec != "":
+                    can_now["can_tec"] = frame_tec
+                    can_now["can_rec"] = frame_rec
                 timing = timing_key(can_now)
                 if timing != prev_timing and any(timing):
                     row = context("timing")
