@@ -31,8 +31,27 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-PSOC_TIME = re.compile(r"^(?P<psoc>(?:\d{2}/\d{2}/\d{2})|(?:--/--/--))\s*(?P<rest>.*)$")
+PSOC_TIME = re.compile(r"^(?P<psoc>(?:\d{2}[/:]\d{2}[/:]\d{2})|(?:--[/:]--[/:]--))\s*(?P<rest>.*)$")
+CLOCK_FACE = re.compile(r"^(?P<h>\d{2})[/:](?P<m>\d{2})[/:](?P<s>\d{2})$")
 DUMP_LINE = re.compile(r"^LOGDUMP\s+(?P<psoc>\S+)\s*(?P<rest>.*)$")
+
+
+def pi_now(millis: bool = True) -> str:
+    """ラズパイの現地時刻。タイムゾーンの表示は付けない。"""
+    now = datetime.now().astimezone()
+    if millis:
+        return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    return now.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def clock_text(raw: str) -> str:
+    """時/分/秒を時:分:秒にする。日付付きやミリ秒の行はそのまま。"""
+    matched = CLOCK_FACE.match(raw)
+    if matched is not None:
+        return f"{matched.group('h')}:{matched.group('m')}:{matched.group('s')}"
+    if raw in ("--/--/--", "--:--:--"):
+        return "--:--:--"
+    return raw
 
 
 def split_line(text: str) -> tuple[str, str]:
@@ -40,7 +59,7 @@ def split_line(text: str) -> tuple[str, str]:
     matched = PSOC_TIME.match(text.strip())
     if matched is None:
         return "", text.strip()
-    return matched.group("psoc"), matched.group("rest")
+    return clock_text(matched.group("psoc")), matched.group("rest")
 
 
 def find_port() -> str:
@@ -147,13 +166,13 @@ def pull_stored(fd: int, handle, writer) -> tuple[bytearray, list[tuple[str, str
                 return pending, early
             matched = DUMP_LINE.match(text)
             if begun and matched is not None:
-                pi_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                pi_time = pi_now()
                 write_row(handle, writer, pi_time, matched.group("psoc"), matched.group("rest"))
                 stored += 1
                 end_deadline = time.monotonic() + 10.0
                 continue
             psoc_time, message = split_line(text)
-            pi_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
+            pi_time = pi_now()
             early.append((pi_time, psoc_time, message))
     return pending, early
 
@@ -545,7 +564,7 @@ def sample_status(
     cpu = read_cpu_jiffies()
     throttled, throttled_label = read_throttled()
     row = {
-        "pi_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "pi_time": pi_now(False),
         "uptime_s": read_uptime(),
         "cpu_temp_c": read_cpu_temp(),
         "input_v": read_input_voltage(),
@@ -563,7 +582,7 @@ def record_uart(handle, writer, text: str) -> None:
     if text in ("LOGBEGIN", "LOGEND") or DUMP_LINE.match(text):
         return
     psoc_time, message = split_line(text)
-    pi_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    pi_time = pi_now()
     write_row(handle, writer, pi_time, psoc_time, message)
     print(text, flush=True)
 
