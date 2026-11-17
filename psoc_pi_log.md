@@ -28,12 +28,11 @@ python3 psoc_pi_log.py --self-test
 | `--can-ms` | 150 | `ip link` を見る間隔（ミリ秒）。50 から 500 |
 | `--iface` | `can0` | CAN インターフェイス |
 | `--app-unit` | 空。環境変数 `PSOC_PI_LOG_APP_UNIT` | 起動と終了を残す systemd unit。空なら残さない |
-| `--keep-days` | 14 | UART と状態 CSV を残す日数 |
-| `--can-keep-days` | 30 | CAN とカーネル CSV を残す日数 |
+| `--keep-files` | 100 | 各フォルダに残す CSV の数。超えたら名前の古いものから消す |
 
 ## ファイル
 
-起動のたびに、その時刻のファイルを 4 つ作る。日付が変わっても、その起動のファイルに書き続ける。
+起動のたびに、その時刻のファイルを 4 つ作る。日付が変わっても、その起動のファイルに書き続ける。各フォルダは 100 個までで、超えたらファイル名の古いものから消す。いま書いているファイルは消さない。
 
 ```text
 log/uart/psoc_uart_YYYYMMDD_HHMMSS.csv
@@ -78,8 +77,8 @@ CSV では次のように読む。`sw` は状態ワードの 16 進。判定に 
 | `m1_remote` / `m2_remote` | 遠隔、またはローカル |
 | `m1_target` / `m2_target` | 到達、または未到達 |
 | `m1_speed` / `m2_speed` | 速度0、または回転 |
-| `m1_limit` / `m2_limit` | 内部制限。立っていなければ空 |
-| `m1_warn` / `m2_warn` | 警告。立っていなければ空 |
+| `m1_limit` / `m2_limit` | 内部制限。立っていなければ `-` |
+| `m1_warn` / `m2_warn` | 警告。立っていなければ `-` |
 | `m1_trq` / `m2_trq` | トルク。バイトが無ければ `不明` |
 | `m1_hwto` / `m2_hwto` | 60FDh の bit3。入、切、または不明 |
 | `m1_son` / `m2_son` | bit16 |
@@ -88,7 +87,7 @@ CSV では次のように読む。`sw` は状態ワードの 16 進。判定に 
 | `corr_ms` | 衝突タイマのミリ秒 |
 | `m1_silent_s` / `m2_silent_s` | 状態フレームが無い秒 |
 
-CAN の列は、その行の種類だけ埋まる。
+CAN の列は、その行の種類だけ値を入れる。モーター状態の行は、どの CAN 異常も無いので `-` にする。
 
 | 列 | 入る行 |
 |---|---|
@@ -104,11 +103,11 @@ CAN の列は、その行の種類だけ埋まる。
 
 `cpu_temp_c` はラズパイの CPU 温度で、`vcgencmd measure_temp` の値。コマンドが使えなければ `/sys/class/thermal/thermal_zone0/temp` を使う。`cpu_pct` は `/proc/stat` から計算した使用率、`load1` は 1 分ロード、`mem_used_pct` はメモリ使用率、`throttled` は `vcgencmd get_throttled` の値と、電圧低下や温度制限などの名前。
 
-`amp`、`temp1`、`temp2`、`temp3` は CAN の 0x090 で、PSoC が送る電流と温度。これは CPU 温度ではない。
+`amp`、`temp1`、`temp2`、`temp3` は CAN の 0x090 で、PSoC が送る電流と温度。これは CPU 温度ではない。まだ受け取っていなければ `-` にする。
 
 CAN の列は `ip -details -statistics link show can0` の値。`can_link` は UP、DOWN、なし。`can_state` は ERROR-ACTIVE など。`can_restarts` から `can_bus_off` までは統計カウンタ。`can_rx` と `can_tx` はパケット数、`can_rx_err` と `can_tx_err` はエラー数、`can_rx_drop` と `can_tx_drop` は取りこぼし。`clock`、`bitrate`、`sample_point`、`sjw`、`restart_ms`、`qlen` はビットタイミング。TEC と REC は記録しない。PSoC の CAN 状態は UART の `CANOFF`、`CANPASV`、`CANERR`、`CANSTOP` に残る。
 
-`last_090` と `age_090_s` のように、次の ID を最後に見た時刻と、そこからの秒を付ける。0x090、0x0A0、0x0C0、0x181、0x182、0x381、0x382。フレームが無ければ空。
+`last_090` と `age_090_s` のように、次の ID を最後に見た時刻と、そこからの秒を付ける。0x090、0x0A0、0x0C0、0x181、0x182、0x381、0x382。まだ見ていなければ `-` にする。
 
 ## CAN の CSV
 
@@ -122,6 +121,8 @@ CAN の列は `ip -details -statistics link show can0` の値。`can_link` は U
 | `state` | 上の状態かカウンタが変わった |
 | `error` | エラーフレームを 1 つ受信した |
 | `app` | `--app-unit` の ActiveState が変わった |
+
+`state` と `timing` の行は、エラーフレームもアプリの変化も無いので、`err_` で始まる列と `app_` で始まる列と `detail` を `-` にする。`error` の行で、そのフレームに無い分類も `-` にする。`ip` から読めなかった CAN の状態は空欄のままにする。
 
 `error` の列は、フレームの内容を分けたもの。
 

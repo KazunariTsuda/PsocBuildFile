@@ -4,10 +4,12 @@
 走行アプリとは別プロセスで動かす。アプリが bus-off で止まっても記録は続ける。
 起動のたびに、開始時刻の付いたファイルを新しく作る。
 
-  log/uart/psoc_uart_YYYYMMDD_HHMMSS.csv      受信した行。14 日
-  log/status/pi_status_YYYYMMDD_HHMMSS.csv    10 秒ごとの状態。14 日
-  log/can/can_event_YYYYMMDD_HHMMSS.csv       ビットタイミング、CAN の変化、エラーフレーム、アプリの起動と終了。30 日
-  log/kernel/kern_YYYYMMDD_HHMMSS.csv         カーネルの落ちた理由と CAN。起動時に前回分もコピー。30 日
+  log/uart/psoc_uart_YYYYMMDD_HHMMSS.csv      受信した行
+  log/status/pi_status_YYYYMMDD_HHMMSS.csv    10 秒ごとの状態
+  log/can/can_event_YYYYMMDD_HHMMSS.csv       ビットタイミング、CAN の変化、エラーフレーム、アプリの起動と終了
+  log/kernel/kern_YYYYMMDD_HHMMSS.csv         カーネルの落ちた理由と CAN。起動時に前回分もコピー
+
+各フォルダは 100 ファイルまで。超えたら名前の古いものから消す。
 
 pi_time は現地時刻にオフセットを付けた ISO 時刻。ミリ秒まで。
 UART は届いた順に書く。並べるときは pi_time を使う。
@@ -29,6 +31,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -318,6 +321,21 @@ CAN_COLUMNS = [
     *AGE_COLUMNS,
     "detail",
 ]
+CAN_ERR_COLUMNS = (
+    "err_cause",
+    "err_class",
+    "err_prot",
+    "err_loc",
+    "err_ctrl",
+    "err_data",
+)
+CAN_APP_COLUMNS = (
+    "app_unit",
+    "app_active",
+    "app_sub",
+    "app_since",
+)
+CAN_ABSENT_COLUMNS = CAN_ERR_COLUMNS + CAN_APP_COLUMNS + ("detail",)
 
 
 def pi_now() -> str:
@@ -379,8 +397,8 @@ def motor_fields(prefix: str, sw_text: str, trq_text: str, din: str) -> dict[str
         f"{prefix}_remote": ("遠隔" if (sw & 0x0200) != 0 else "ローカル") if sw_text else "",
         f"{prefix}_target": ("到達" if (sw & 0x0400) != 0 else "未到達") if sw_text else "",
         f"{prefix}_speed": ("速度0" if (sw & 0x1000) != 0 else "回転") if sw_text else "",
-        f"{prefix}_limit": "内部制限" if sw_text and (sw & 0x0800) != 0 else "",
-        f"{prefix}_warn": "警告" if sw_text and (sw & 0x0080) != 0 else "",
+        f"{prefix}_limit": "内部制限" if sw_text and (sw & 0x0800) != 0 else ("-" if sw_text else ""),
+        f"{prefix}_warn": "警告" if sw_text and (sw & 0x0080) != 0 else ("-" if sw_text else ""),
         f"{prefix}_trq": trq_text if trq_text != "" else "不明",
         f"{prefix}_hwto": din_text(din, 3),
         f"{prefix}_son": din_text(din, 16),
@@ -427,6 +445,8 @@ def uart_from_line(psoc_time: str, rest: str, kind_hint: str = "") -> dict[str, 
         row["corr_ms"] = parts[8]
         row["m1_silent_s"] = parts[9]
         row["m2_silent_s"] = parts[10]
+        for key in UART_COLUMNS[UART_COLUMNS.index("can_tec"):]:
+            row[key] = "-"
     elif tag == "CANOFF" and len(parts) >= 4:
         row["kind"] = "CANOFF"
         row["can_tec"] = parts[1]
@@ -830,13 +850,13 @@ class DayFile:
         directory: Path,
         prefix: str,
         columns: list[str],
-        keep_days: int,
+        keep_files: int,
         stamp: str,
     ) -> None:
         self.directory = directory
         self.prefix = prefix
         self.columns = columns
-        self.keep_days = keep_days
+        self.keep_files = keep_files
         self.stamp = stamp
         self.handle = None
         self.writer: csv.DictWriter | None = None
@@ -862,7 +882,7 @@ class DayFile:
             self.handle.flush()
             os.fsync(self.handle.fileno())
         self.path = path
-        prune_days(self.directory, self.prefix, self.keep_days)
+        prune_count(self.directory, self.prefix, self.keep_files, path)
 
     def _compatible_path(self, path: Path) -> Path:
         if (not path.exists()) or path.stat().st_size == 0:
@@ -904,16 +924,40 @@ class DayFile:
         self.writer = None
 
 
-def prune_days(directory: Path, prefix: str, keep_days: int) -> None:
-    cutoff = time.time() - keep_days * 86400
-    if not directory.is_dir():
+def prune_count(directory: Path, prefix: str, keep: int, current: Path) -> None:
+    """同じ接頭辞の CSV が keep 個を超えたら、名前の古いものから消す。"""
+    if keep < 1 or not directory.is_dir():
         return
+    try:
+        current_resolved = current.resolve()
+    except OSError:
+        current_resolved = current
+    others: list[Path] = []
     for path in directory.glob(f"{prefix}_*.csv"):
+        if not path.is_file():
+            continue
         try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
+            if path.resolve() == current_resolved:
+                continue
+        except OSError:
+            continue
+        others.append(path)
+    overflow = len(others) + 1 - keep
+    if overflow <= 0:
+        return
+    others.sort(key=lambda path: path.name)
+    for path in others[:overflow]:
+        try:
+            path.unlink()
         except OSError:
             pass
+
+
+def mark_clear(row: dict[str, str], keys: tuple[str, ...]) -> None:
+    """値が無い列を - にする。"""
+    for key in keys:
+        if row.get(key, "") == "":
+            row[key] = "-"
 
 
 def blank_can() -> dict[str, str]:
@@ -925,8 +969,8 @@ def age_fields(seen: dict[int, tuple[float, str]], now: float) -> dict[str, str]
     for can_id, tag in AGE_IDS:
         hit = seen.get(can_id)
         if hit is None:
-            row[f"last_{tag}"] = ""
-            row[f"age_{tag}_s"] = ""
+            row[f"last_{tag}"] = "-"
+            row[f"age_{tag}_s"] = "-"
         else:
             mono, stamp = hit
             row[f"last_{tag}"] = stamp
@@ -1202,12 +1246,21 @@ def self_test() -> int:
     check(motor["m1_state"] == "運転可" and motor["m1_remote"] == "遠隔", "m1 state")
     check(motor["m1_target"] == "到達" and motor["m1_speed"] == "回転", "m1 bits")
     check(motor["m1_limit"] == "内部制限" and motor["m1_trq"] == "-17", "m1 trq")
+    check(motor["m1_warn"] == "-" and motor["m2_limit"] == "-" and motor["m2_warn"] == "-", "clear flags")
+    check(motor["can_tec"] == "-" and motor["can_stop_s"] == "-", "motor can dash")
+    unseen = age_fields({}, 0.0)
+    check(unseen["last_090"] == "-" and unseen["age_181_s"] == "-", "unseen age")
+    seen_age = age_fields({0x181: (0.0, "t")}, 1.5)
+    check(seen_age["last_181"] == "t" and seen_age["age_181_s"] == "1.5", "seen age")
+    clear_row = {"err_cause": "", "detail": "残す"}
+    mark_clear(clear_row, ("err_cause", "detail"))
+    check(clear_row["err_cause"] == "-" and clear_row["detail"] == "残す", "mark clear")
     check(motor["m1_hwto"] == "入" and motor["m1_son"] == "切" and motor["m1_stop"] == "切", "m1 din")
     check(motor["m2_state"] == "励磁不可" and motor["m2_trq"] == "不明", "m2 missing trq")
     check(motor["m2_hwto"] == "不明" and motor["nocmd_s"] == "101", "m2 din empty")
     check(motor["m1_silent_s"] == "1" and motor["m2_silent_s"] == "2", "silence")
     can = uart_from_line("17:21:00", "CANERR,0,0,0,0,0,2,0,181=3")
-    check(can["can_arb"] == "2" and can["can_txfail"] == "181=3", "canerr")
+    check(can["can_arb"] == "2" and can["can_txfail"] == "181=3" and can["can_tec"] == "", "canerr")
     text, sts = split_dump_rest("01,20,03,0a START 1")
     check(text == "START 1" and sts["sts2"] == "20" and sts["sts3"] == "03", "dump sts")
     check(split_dump_rest("RASP RS")[0] == "RASP RS", "dump without sts")
@@ -1242,6 +1295,21 @@ def self_test() -> int:
     zero = {"sample_point": "0.875", "sjw": "2", "restart_ms": "0"}
     check("自動復帰しない" in timing_detail(zero), "restart 0")
     check("同じ" in timing_detail({"sample_point": "0.875", "sjw": "2", "restart_ms": "100"}), "match")
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        for n in range(4):
+            (folder / f"psoc_uart_2026010{n}_000000.csv").write_text("x", encoding="utf-8")
+        current = folder / "psoc_uart_20260103_000000.csv"
+        prune_count(folder, "psoc_uart", 3, current)
+        left = sorted(path.name for path in folder.glob("psoc_uart_*.csv"))
+        check(
+            left == [
+                "psoc_uart_20260101_000000.csv",
+                "psoc_uart_20260102_000000.csv",
+                "psoc_uart_20260103_000000.csv",
+            ],
+            "keep newest files " + ",".join(left),
+        )
 
     print("self-test", "ok" if failed == 0 else f"{failed} failed")
     return 1 if failed else 0
@@ -1262,22 +1330,21 @@ def main() -> int:
         default=os.environ.get("PSOC_PI_LOG_APP_UNIT", ""),
         help="起動と終了を残す systemd unit。未指定なら残さない",
     )
-    parser.add_argument("--keep-days", type=int, default=14)
-    parser.add_argument("--can-keep-days", type=int, default=30)
+    parser.add_argument("--keep-files", type=int, default=100)
     args = parser.parse_args()
     if args.interval < 1.0:
         parser.error("--interval は 1 以上")
     if not 50.0 <= args.can_ms <= 500.0:
         parser.error("--can-ms は 50 から 500")
-    if args.keep_days < 1 or args.can_keep_days < 1:
-        parser.error("保持日数は 1 以上")
+    if args.keep_files < 1:
+        parser.error("--keep-files は 1 以上")
 
     root = Path(args.dir)
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    uart_book = DayFile(root / "uart", "psoc_uart", UART_COLUMNS, args.keep_days, stamp)
-    status_book = DayFile(root / "status", "pi_status", STATUS_COLUMNS, args.keep_days, stamp)
-    can_book = DayFile(root / "can", "can_event", CAN_COLUMNS, args.can_keep_days, stamp)
-    kern_book = DayFile(root / "kernel", "kern", KERN_COLUMNS, args.can_keep_days, stamp)
+    uart_book = DayFile(root / "uart", "psoc_uart", UART_COLUMNS, args.keep_files, stamp)
+    status_book = DayFile(root / "status", "pi_status", STATUS_COLUMNS, args.keep_files, stamp)
+    can_book = DayFile(root / "can", "can_event", CAN_COLUMNS, args.keep_files, stamp)
+    kern_book = DayFile(root / "kernel", "kern", KERN_COLUMNS, args.keep_files, stamp)
     uart_book.ensure()
     can_book.ensure()
     print(f"UART: {uart_book.path}", flush=True)
@@ -1323,7 +1390,7 @@ def main() -> int:
     can_interval = args.can_ms / 1000.0
 
     def power_now() -> dict[str, str]:
-        return dict(power)
+        return {key: value if value != "" else "-" for key, value in power.items()}
 
     def context(kind: str) -> dict[str, str]:
         row = blank_can()
@@ -1333,6 +1400,7 @@ def main() -> int:
         row.update({key: can_now.get(key, "") for key in TIMING_KEYS})
         row.update(power_now())
         row.update(age_fields(seen, time.monotonic()))
+        mark_clear(row, CAN_ABSENT_COLUMNS)
         return row
 
     def pull_can() -> None:
@@ -1343,6 +1411,7 @@ def main() -> int:
                 decoded = decode_error(can_id, data)
                 row = context("error")
                 row.update(decoded)
+                mark_clear(row, CAN_ERR_COLUMNS)
                 can_book.write(row, sync=False)
         if id_sock is not None:
             for can_id, dlc, data in drain_frames(id_sock):
@@ -1411,6 +1480,7 @@ def main() -> int:
                 if app is not None and app != prev_app:
                     row = context("app")
                     row.update(app)
+                    mark_clear(row, CAN_APP_COLUMNS)
                     can_book.write(row)
                     prev_app = app
                 next_app = time.monotonic() + 1.0
