@@ -7,7 +7,7 @@
   log/uart/psoc_uart_YYYYMMDD_HHMMSS.csv      受信した行。14 日
   log/status/pi_status_YYYYMMDD_HHMMSS.csv    10 秒ごとの状態。14 日
   log/can/can_event_YYYYMMDD_HHMMSS.csv       ビットタイミング、CAN の変化、エラーフレーム、アプリの起動と終了。30 日
-  log/kernel/kern_YYYYMMDD_HHMMSS.csv         journalctl -k のうち CAN / SPI。30 日
+  log/kernel/kern_YYYYMMDD_HHMMSS.csv         カーネルの落ちた理由と CAN。起動時に前回分もコピー。30 日
 
 pi_time は現地時刻にオフセットを付けた ISO 時刻。ミリ秒まで。
 UART は届いた順に書く。並べるときは pi_time を使う。
@@ -125,7 +125,6 @@ CTRL_BITS = (
 
 # 0x181 / 0x182 は、この PSoC がモータ状態として受信している TPDO。
 # 0x381 / 0x382 は依頼どおり別に見る。出ていなければ列は空のまま。
-WATCH_IDS = (0x090, 0x092, 0x0A0, 0x0C0, 0x181, 0x182, 0x381, 0x382)
 AGE_IDS = (
     (0x090, "090"),
     (0x0A0, "0a0"),
@@ -135,6 +134,7 @@ AGE_IDS = (
     (0x381, "381"),
     (0x382, "382"),
 )
+WATCH_IDS = tuple(can_id for can_id, _tag in AGE_IDS)
 
 RE_STATE = re.compile(r"can state (\S+)")
 RE_BITRATE = re.compile(r"\bbitrate\s+(\d+)")
@@ -159,21 +159,17 @@ RE_TX = re.compile(
     r"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
     re.S,
 )
-KERN_KEEP = re.compile(r"mcp251|\bcan\d|\bspi|overflow|bus-off|bus off", re.I)
+KERN_KEEP = re.compile(
+    r"mcp251|\bcan\d|\bspi|overflow|bus-off|bus off"
+    r"|oops|panic|internal error|unable to handle|kernel bug|\bbug:"
+    r"|hung.task|blocked for more than"
+    r"|out of memory|oom-kill|killed process"
+    r"|watchdog|under-?voltage|thermal|throttl"
+    r"|mmc\d|i/o error|ext4-fs|usb disconnect",
+    re.I,
+)
 BLOCKED_TTY = {"serial0", "serial1", "ttyama0", "ttys0"}
 
-PSOC_FLAG_BITS = (
-    (0x01, "停止中"),
-    (0x02, "試行上限"),
-    (0x04, "送信警告"),
-    (0x08, "受信警告"),
-    (0x10, "passive"),
-    (0x20, "bus-off"),
-)
-PSOC_HW_BITS = (
-    (0x01, "passive"),
-    (0x02, "bus-off"),
-)
 THROTTLE_BITS = (
     (1 << 0, "電圧低下"),
     (1 << 1, "周波数制限"),
@@ -194,6 +190,10 @@ CHANGE_KEYS = (
     "can_error_warn",
     "can_error_pass",
     "can_bus_off",
+    "can_rx_err",
+    "can_rx_drop",
+    "can_tx_err",
+    "can_tx_drop",
 )
 TIMING_KEYS = ("clock", "bitrate", "sample_point", "sjw", "restart_ms", "qlen")
 
@@ -281,13 +281,6 @@ STATUS_COLUMNS = [
     "sjw",
     "restart_ms",
     "qlen",
-    "psoc_tec",
-    "psoc_rec",
-    "psoc_busoff",
-    "psoc_attempts",
-    "psoc_flags",
-    "psoc_hw",
-    "psoc_age_s",
     *AGE_COLUMNS,
 ]
 CAN_COLUMNS = [
@@ -301,6 +294,10 @@ CAN_COLUMNS = [
     "can_error_warn",
     "can_error_pass",
     "can_bus_off",
+    "can_rx_err",
+    "can_rx_drop",
+    "can_tx_err",
+    "can_tx_drop",
     "clock",
     "bitrate",
     "sample_point",
@@ -451,11 +448,6 @@ def uart_from_line(psoc_time: str, rest: str, kind_hint: str = "") -> dict[str, 
     else:
         row["kind"] = kind_hint or "event"
     return row
-
-
-def bit_text(value: int, bits: tuple[tuple[int, str], ...]) -> str:
-    names = [label for bit, label in bits if value & bit]
-    return " ".join(names)
 
 
 def names_of(value: int, bits: tuple[tuple[int, str], ...]) -> list[str]:
@@ -946,6 +938,20 @@ def kernel_keep(line: str) -> bool:
     return KERN_KEEP.search(line) is not None
 
 
+def previous_kernel_lines() -> list[str]:
+    """前回起動の末尾から、落ちた理由と CAN の行を取る。"""
+    text = run_cmd(
+        ["journalctl", "-b", "-1", "-k", "-n", "400", "-o", "short-iso", "--no-pager"],
+        3.0,
+    )
+    kept: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and kernel_keep(line) and not line.startswith("-- "):
+            kept.append(line)
+    return kept
+
+
 def split_kern(line: str) -> tuple[str, str]:
     head, _, tail = line.partition(" ")
     if "T" in head and any(ch.isdigit() for ch in head):
@@ -1226,6 +1232,13 @@ def self_test() -> int:
     changed["can_state"] = "BUS-OFF"
     check(change_key(same) == change_key(other), "rx is not a change")
     check(change_key(same) != change_key(changed), "state is a change")
+    tx_err = dict(same)
+    tx_err["can_tx_err"] = "3"
+    check(change_key(same) != change_key(tx_err), "tx err is a change")
+    check(kernel_keep("Kernel panic - not syncing"), "keep panic")
+    check(kernel_keep("hwmon: Under-voltage detected!"), "keep undervoltage")
+    check(kernel_keep("mcp251x can0: bus-off"), "keep can")
+    check(not kernel_keep("systemd[1]: Started foo"), "drop other kernel")
     zero = {"sample_point": "0.875", "sjw": "2", "restart_ms": "0"}
     check("自動復帰しない" in timing_detail(zero), "restart 0")
     check("同じ" in timing_detail({"sample_point": "0.875", "sjw": "2", "restart_ms": "100"}), "match")
@@ -1276,6 +1289,20 @@ def main() -> int:
         flush=True,
     )
     uart_book.write(uart_note("記録開始" + (f" port={args.port}" if args.port else "")))
+    previous = previous_kernel_lines()
+    if previous:
+        kern_book.write({"pi_time": pi_now(), "kern_time": "", "message": "前回起動の該当行"})
+        for line in previous:
+            kern_time, message = split_kern(line)
+            kern_book.write(
+                {"pi_time": pi_now(), "kern_time": kern_time, "message": message},
+                sync=False,
+            )
+        kern_book.sync_pending(time.monotonic(), 0.0)
+    else:
+        kern_book.write(
+            {"pi_time": pi_now(), "kern_time": "", "message": "前回起動に該当行はありません"}
+        )
 
     link = UartLink(args.port)
     kernel = KernelFollow()
@@ -1284,8 +1311,6 @@ def main() -> int:
     next_sock = 0.0
     sock_failed = False
     seen: dict[int, tuple[float, str]] = {}
-    health: bytes | None = None
-    health_at: float | None = None
     power = {"amp": "", "temp1": "", "temp2": "", "temp3": ""}
     can_now: dict[str, str] = parse_can("")
     prev_change: tuple[str, ...] | None = None
@@ -1311,7 +1336,6 @@ def main() -> int:
         return row
 
     def pull_can() -> None:
-        nonlocal health, health_at
         if err_sock is not None:
             for can_id, _dlc, data in drain_frames(err_sock):
                 if not (can_id & CAN_ERR_FLAG):
@@ -1325,16 +1349,13 @@ def main() -> int:
                 if can_id & CAN_ERR_FLAG:
                     continue
                 sid = can_id & CAN_SFF_MASK
-                if sid in {item[0] for item in AGE_IDS} or sid == 0x092:
+                if sid in {item[0] for item in AGE_IDS}:
                     seen[sid] = (time.monotonic(), pi_now())
                 if sid == 0x090 and dlc >= 8:
                     power["amp"] = str(u16be(data, 0))
                     power["temp1"] = str(u16be(data, 2))
                     power["temp2"] = str(u16be(data, 4))
                     power["temp3"] = str(u16be(data, 6))
-                elif sid == 0x092 and dlc >= 6:
-                    health = data
-                    health_at = time.monotonic()
 
     def request_stop(signum, frame):
         raise KeyboardInterrupt
@@ -1408,17 +1429,6 @@ def main() -> int:
                 }
                 row.update(power_now())
                 row.update(can_now)
-                if health is not None and health_at is not None and len(health) >= 6:
-                    row["psoc_tec"] = str(health[0])
-                    row["psoc_rec"] = str(health[1])
-                    row["psoc_busoff"] = str((health[2] << 8) | health[3])
-                    row["psoc_attempts"] = str(health[4])
-                    flags = bit_text(health[5], PSOC_FLAG_BITS) or "なし"
-                    row["psoc_flags"] = f"0x{health[5]:02x} {flags}"
-                    if len(health) >= 7:
-                        hw = bit_text(health[6], PSOC_HW_BITS) or "なし"
-                        row["psoc_hw"] = f"0x{health[6]:02x} {hw}"
-                    row["psoc_age_s"] = f"{time.monotonic() - health_at:.1f}"
                 row.update(age_fields(seen, time.monotonic()))
                 status_book.write(row)
                 cpu = fresh
