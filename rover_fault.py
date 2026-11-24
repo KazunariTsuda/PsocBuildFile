@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # File Name: rover_fault.py
-# Version: 0.1.1
+# Version: 0.1.2
 # Description: Rover MPPT の故障ビットマップ（保持レジスタ 0x0121 / 0x0122）を読む。
 # Development Environment:
 #   Raspberry Pi（/dev/serial0, GPIO27 = DE/RE）
@@ -10,10 +10,10 @@
 #   RPi.GPIO
 #
 # 電圧読み取り（0x0101 を 1 ワード）と同じバス設定。
-# 要求は 8 バイト。write() の戻りはシフト完了ではないので、
-# tcdrain のあと 4 ms 待ってから DE を受信に戻す。
+# 要求は 8 バイト。write() の戻りはシフト完了ではないので tcdrain する。
+# 実機は応答が速く、シフト完了から 4 ms 待つと先頭バイトを取りこぼす。
+# 受信は無音 15 ms で区切る。1 秒溜めると、別プロセスの電圧応答が連結する。
 # 正常応答は 9 バイト（データ 4 バイト）。例外応答は 5 バイト。
-# 無応答のときは 0x0101 と 0x0120〜0x0122 を 1 ワードずつ読んで切り分ける。
 #
 # ビットの意味は世代で 16 ビットずれる。
 #   Renogy 2025: 主なフラグは下位（0x0122）
@@ -36,8 +36,11 @@ READ_REGISTER_COUNT = 2
 
 FRAME_SILENT_TIME = 0.05
 RESPONSE_TIMEOUT = 1.0
-# 最終ビットが出てから受信に戻すまでの待ち。3.5 文字時間（約 3.6 ms）より少し長い。
-TX_TURNAROUND = 0.004
+# 最終ビットのあと、ストップビットを切らない範囲で受信に戻す。
+TX_TURNAROUND = 0.001
+# 9600 8N1 の 3.5 文字時間は約 3.6 ms。無音がこれより長ければフレームは終わっている。
+RX_GAP = 0.015
+READ_ATTEMPTS = 3
 
 # 立っているビットだけを、この順で表示する。(Renogy 2025, Classic Rover)
 FAULT_BITS = (
@@ -120,32 +123,50 @@ def build_request(addr: int = FAULT_ADDR, count: int = READ_REGISTER_COUNT) -> b
 	return add_crc(frame)
 
 
-def expected_length(data: bytes) -> int | None:
-	"""先頭 3 バイトが揃ってから、フレーム長を決める。"""
-	if len(data) < 3:
-		return None
-	if data[1] & 0x80:
-		return 5
-	if data[1] == 0x03:
-		return 5 + data[2]
+def find_frame(data: bytes, count: int) -> bytes | None:
+	"""生バイト列の途中から、CRC が合う応答を 1 つ取り出す。"""
+	want = count * 2
+	i = 0
+	while i + 5 <= len(data):
+		if data[i] != SLAVE_ID:
+			i += 1
+			continue
+		fc = data[i + 1]
+		if fc & 0x80:
+			end = i + 5
+		elif fc == 0x03:
+			end = i + 5 + data[i + 2]
+		else:
+			i += 1
+			continue
+		if end > len(data):
+			i += 1
+			continue
+		frame = data[i:end]
+		got = frame[-2] | (frame[-1] << 8)
+		if modbus_crc16(frame[:-2]) != got:
+			i += 1
+			continue
+		if fc & 0x80 or data[i + 2] == want:
+			return frame
+		i = end
 	return None
 
 
 def read_response(ser: serial.Serial, timeout: float) -> bytes:
-	start = time.time()
+	deadline = time.time() + timeout
 	data = bytearray()
+	last = None
 
-	while time.time() - start < timeout:
+	while time.time() < deadline:
 		n = ser.in_waiting
-
 		if n > 0:
 			data.extend(ser.read(n))
-			start = time.time()
-			need = expected_length(data)
-			if need is not None and len(data) >= need:
-				break
-
-		time.sleep(0.001)
+			last = time.time()
+		elif last is not None and time.time() - last >= RX_GAP:
+			break
+		else:
+			time.sleep(0.0005)
 
 	return bytes(data)
 
@@ -169,14 +190,21 @@ def send_request_and_read(ser: serial.Serial, request: bytes) -> bytes | None:
 
 	GPIO.output(DE_RE_PIN, GPIO.LOW)
 
-	response = read_response(ser, RESPONSE_TIMEOUT)
+	raw = read_response(ser, RESPONSE_TIMEOUT)
 
-	if not response:
+	if not raw:
 		print("RX: timeout")
 		return None
 
-	print_hex("RX", response)
-	return response
+	print_hex("RX", raw)
+	# count は要求の下位バイト。連結した別応答を、欲しい長さのフレームだけ採用する。
+	frame = find_frame(raw, request[5])
+	if frame is None:
+		print(f"NG: no matched frame in {len(raw)} bytes")
+		return None
+	if frame != raw:
+		print_hex("RX recovered", frame)
+	return frame
 
 
 def check_header(response: bytes) -> bool:
@@ -263,7 +291,7 @@ def diagnose_timeout(ser: serial.Serial):
 	print("電圧（0x0101）でバスを確認します")
 	voltage = read_registers(ser, 0x0101, 1)
 	if voltage is None:
-		print("電圧も無応答です。Rover がこの UART に応答していません")
+		print("電圧の応答も揃っていません。先頭の取りこぼしか、電圧読み取りとの衝突です")
 		return
 
 	print(f"Battery Voltage: {voltage[0] * 0.1:.1f} V")
@@ -301,7 +329,13 @@ def main():
 			input("\nEnterキーで取得 > ")
 
 			try:
-				words = read_registers(ser, FAULT_ADDR, READ_REGISTER_COUNT)
+				words = None
+				for attempt in range(READ_ATTEMPTS):
+					words = read_registers(ser, FAULT_ADDR, READ_REGISTER_COUNT)
+					if words is not None:
+						break
+					if attempt + 1 < READ_ATTEMPTS:
+						print(f"retry {attempt + 2}/{READ_ATTEMPTS}")
 
 				if words is not None:
 					print_fault_bitmap((words[0] << 16) | words[1])
