@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # File Name: rover_fault.py
-# Version: 0.1.0
+# Version: 0.1.1
 # Description: Rover MPPT の故障ビットマップ（保持レジスタ 0x0121 / 0x0122）を読む。
 # Development Environment:
 #   Raspberry Pi（/dev/serial0, GPIO27 = DE/RE）
@@ -10,8 +10,10 @@
 #   RPi.GPIO
 #
 # 電圧読み取り（0x0101 を 1 ワード）と同じバス設定。
-# 要求は 8 バイトのままなので、送信完了待ちは電圧スクリプトと同じ 9 ms。
+# 要求は 8 バイト。write() の戻りはシフト完了ではないので、
+# tcdrain のあと 4 ms 待ってから DE を受信に戻す。
 # 正常応答は 9 バイト（データ 4 バイト）。例外応答は 5 バイト。
+# 無応答のときは 0x0101 と 0x0120〜0x0122 を 1 ワードずつ読んで切り分ける。
 #
 # ビットの意味は世代で 16 ビットずれる。
 #   Renogy 2025: 主なフラグは下位（0x0122）
@@ -34,8 +36,8 @@ READ_REGISTER_COUNT = 2
 
 FRAME_SILENT_TIME = 0.05
 RESPONSE_TIMEOUT = 1.0
-# 9600 8N1 で 8 バイト送る時間（10 bit/byte）に 1 ms 足した値。
-TX_WAIT_TIME = 0.009
+# 最終ビットが出てから受信に戻すまでの待ち。3.5 文字時間（約 3.6 ms）より少し長い。
+TX_TURNAROUND = 0.004
 
 # 立っているビットだけを、この順で表示する。(Renogy 2025, Classic Rover)
 FAULT_BITS = (
@@ -106,14 +108,14 @@ def print_hex(label: str, data: bytes):
 	print(f"{label}: {data.hex(' ')}")
 
 
-def build_request() -> bytes:
+def build_request(addr: int = FAULT_ADDR, count: int = READ_REGISTER_COUNT) -> bytes:
 	frame = bytes([
 		SLAVE_ID,
 		0x03,
-		(FAULT_ADDR >> 8) & 0xFF,
-		FAULT_ADDR & 0xFF,
-		(READ_REGISTER_COUNT >> 8) & 0xFF,
-		READ_REGISTER_COUNT & 0xFF,
+		(addr >> 8) & 0xFF,
+		addr & 0xFF,
+		(count >> 8) & 0xFF,
+		count & 0xFF,
 	])
 	return add_crc(frame)
 
@@ -161,7 +163,9 @@ def send_request_and_read(ser: serial.Serial, request: bytes) -> bytes | None:
 	time.sleep(0.0001)
 
 	ser.write(request)
-	time.sleep(TX_WAIT_TIME)
+	# write() はカーネルへ渡した時点で戻る。シフトが終わるまで DE を維持する。
+	ser.flush()
+	time.sleep(TX_TURNAROUND)
 
 	GPIO.output(DE_RE_PIN, GPIO.LOW)
 
@@ -202,8 +206,8 @@ def check_header(response: bytes) -> bool:
 	return True
 
 
-def parse_fault_bitmap(response: bytes) -> int | None:
-	# 例外は 5 バイト。正常は ID + FC + バイト数 + データ 4 + CRC 2。
+def parse_registers(response: bytes, count: int) -> list[int] | None:
+	# 例外は 5 バイト。正常は ID + FC + バイト数 + データ + CRC 2。
 	if len(response) < 5:
 		print(f"NG: response length error: {len(response)} bytes")
 		return None
@@ -211,17 +215,22 @@ def parse_fault_bitmap(response: bytes) -> int | None:
 	if not check_header(response):
 		return None
 
-	if response[2] != 4:
+	if response[2] != count * 2 or len(response) != 5 + count * 2:
 		print(f"NG: unexpected byte count: {response[2]}")
 		return None
 
-	if len(response) != 9:
-		print(f"NG: response length error: {len(response)} bytes")
-		return None
+	words = []
+	for i in range(count):
+		off = 3 + (i * 2)
+		words.append((response[off] << 8) | response[off + 1])
+	return words
 
-	high = (response[3] << 8) | response[4]
-	low = (response[5] << 8) | response[6]
-	return (high << 16) | low
+
+def parse_fault_bitmap(response: bytes) -> int | None:
+	words = parse_registers(response, READ_REGISTER_COUNT)
+	if words is None:
+		return None
+	return (words[0] << 16) | words[1]
 
 
 def print_fault_bitmap(bitmap: int):
@@ -242,14 +251,33 @@ def print_fault_bitmap(bitmap: int):
 			print(f"B{bit:<3} {renogy:<28} {classic}")
 
 
-def read_fault_bitmap(ser: serial.Serial) -> int | None:
-	request = build_request()
-	response = send_request_and_read(ser, request)
-
+def read_registers(ser: serial.Serial, addr: int, count: int) -> list[int] | None:
+	response = send_request_and_read(ser, build_request(addr, count))
 	if response is None:
 		return None
+	return parse_registers(response, count)
 
-	return parse_fault_bitmap(response)
+
+def diagnose_timeout(ser: serial.Serial):
+	"""0x0121 が無応答のとき、バスと隣接レジスタのどちらが黙っているかを分ける。"""
+	print("電圧（0x0101）でバスを確認します")
+	voltage = read_registers(ser, 0x0101, 1)
+	if voltage is None:
+		print("電圧も無応答です。Rover がこの UART に応答していません")
+		return
+
+	print(f"Battery Voltage: {voltage[0] * 0.1:.1f} V")
+	print("0x0120 から 0x0122 を 1 ワードずつ読みます")
+	got = False
+	for addr in (0x0120, 0x0121, 0x0122):
+		words = read_registers(ser, addr, 1)
+		if words is None:
+			continue
+		got = True
+		print(f"0x{addr:04X}: 0x{words[0]:04X}")
+
+	if not got:
+		print("電圧は返ります。0x0120〜0x0122 はこの個体から返りません")
 
 
 def main():
@@ -273,12 +301,13 @@ def main():
 			input("\nEnterキーで取得 > ")
 
 			try:
-				bitmap = read_fault_bitmap(ser)
+				words = read_registers(ser, FAULT_ADDR, READ_REGISTER_COUNT)
 
-				if bitmap is not None:
-					print_fault_bitmap(bitmap)
+				if words is not None:
+					print_fault_bitmap((words[0] << 16) | words[1])
 				else:
 					print("Fault bitmap: read failed")
+					diagnose_timeout(ser)
 
 			except Exception as e:
 				print("Exception:", e)
